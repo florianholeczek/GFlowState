@@ -1,8 +1,13 @@
 import ast
 import io
 
+import matplotlib
 import numpy as np
-from matplotlib import pyplot as plt
+
+# non-GUI backend: the image functions run in Flask worker threads, where the
+# default Tk backend crashes the server (Tcl_AsyncDelete)
+matplotlib.use("Agg")
+from matplotlib import pyplot as plt  # noqa: E402
 
 from dashboard import run_dashboard
 

@@ -125,6 +125,7 @@ def run_dashboard(
         dcc.Store(id="dag-overview-edge-list", data= []),
         dcc.Store(id="hexbin-size", data=8),
         dcc.Store(id="dag-overview-page", data=0),
+        dcc.Store(id="dag-fit-dummy"),
 
         # ================= LEFT SIDEBAR (12%) =================
         html.Div([
@@ -701,6 +702,28 @@ def run_dashboard(
                 {"display": "block"},
                 "DAG"
             )
+
+    # The DAG is laid out while its tab may be hidden (container width 0), so the
+    # viewport is not fitted. Resize and fit it when the DAG tab is shown.
+    app.clientside_callback(
+        """
+        function(activeTab) {
+            if (activeTab === "dag-view") {
+                requestAnimationFrame(() => {
+                    const el = document.getElementById("dag-graph");
+                    const cy = el && el._cyreg && el._cyreg.cy;
+                    if (cy) {
+                        cy.resize();
+                        cy.fit(undefined, 30);
+                    }
+                });
+            }
+            return window.dash_clientside.no_update;
+        }
+        """,
+        Output("dag-fit-dummy", "data"),
+        Input("active-tab", "data"),
+    )
 
     # Downprojection parameter header
     @app.callback(

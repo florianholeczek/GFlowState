@@ -999,7 +999,15 @@ class Plotter:
             edges.rename(columns={"source": "target", "target": "source"}, inplace=True)
 
         if self.s0 != "#":
-            nodes.loc[nodes["id"] == "#", "image"] = self.image_fn(self.s0)
+            # same handling as for the other nodes: lists are joined to one string
+            s0_image = self.image_fn(self.s0)
+            is_root = nodes["id"] == "#"
+            nodes.loc[is_root, "has_image"] = (
+                "str" if isinstance(s0_image, str) else "list"
+            )
+            nodes.loc[is_root, "image"] = (
+                "\n".join(s0_image) if isinstance(s0_image, list) else s0_image
+            )
 
         # convert to cytoscape structure
         nodes = [{"data": row} for row in nodes.to_dict(orient="records")]
