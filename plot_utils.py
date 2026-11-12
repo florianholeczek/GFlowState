@@ -1,9 +1,11 @@
+import heapq
 import sqlite3
 import pandas as pd
 import numpy as np
 import plotly.graph_objects as go
 import plotly.express as px
 from plotly.subplots import make_subplots
+from plotly.colors import make_colorscale
 from sklearn import manifold
 from umap import UMAP
 from dash import html
@@ -1542,161 +1544,151 @@ class Plotter:
 
         return fig
 
-    def update_bump_all(self, df, n_top, selected_ids, fo_metric, order):
+    def prepare_bump_all(self, df, n_top, order):
         """
-        Optimized bump chart update for cumulative top-ranked objects
-        where rewards are fixed but rank evolves as new objects appear.
+        Selection-independent part of the cumulative bump chart: for each iteration, rank the
+        n_top best objects seen so far (an object keeps its latest metric value).
+        The result can be cached and reused for different selections.
 
         :param df: prepared dataframe (should NOT include testset rows)
         :param n_top: number of top objects to display
-        :param selected_ids: list of final_ids to highlight
         :param order: highest or lowest for highest/lowest rank
-        :return: Plotly figure
+        :return: dict with the ranked points ("points") and the iteration range ("it_min", "it_max")
         """
+        # Sort key: NaN last, then metric (desc for "highest"), then text as tiebreaker
+        sign = -1 if order == "highest" else 1
 
-        df["iteration"] = pd.Categorical(
-            df["iteration"], categories=sorted(df["iteration"].unique()), ordered=True
-        )
+        def rank_key(item):
+            text, metric = item
+            is_nan = metric != metric
+            return (is_nan, 0 if is_nan else sign * metric, text)
 
-        iterations = df["iteration"].cat.categories
         records = []
-
-        # Track objects seen so far and their fixed rewards
         seen_objects = {}
-
-        for it in iterations:
-            # Add objects from this iteration
-            current_iter_data = df[df["iteration"] == it]
-            for _, row in current_iter_data.iterrows():
-                seen_objects[row["text"]] = row["metric"]
-
-            # Compute ranks for all seen objects
-            # Use text as tiebreaker to ensure stable ordering for equal rewards
-            asc = [False, True] if order == "highest" else [True, True]
-            tmp_rank = (
-                pd.DataFrame(
-                    {
-                        "text": list(seen_objects.keys()),
-                        "metric": list(seen_objects.values()),
-                    }
-                )
-                .sort_values(["metric", "text"], ascending=asc)
-                .head(n_top)
+        for it, group in df.groupby("iteration", sort=True):
+            # Add objects from this iteration (later rows overwrite earlier ones)
+            seen_objects.update(zip(group["text"], group["metric"]))
+            top = heapq.nsmallest(n_top, seen_objects.items(), key=rank_key)
+            records.extend(
+                (it, text, rank, metric)
+                for rank, (text, metric) in enumerate(top, start=1)
             )
-            tmp_rank["rank"] = range(1, len(tmp_rank) + 1)
-            tmp_rank["iteration"] = it
 
-            records.append(tmp_rank[["iteration", "text", "rank", "metric"]])
-
-        tmp = pd.concat(records, ignore_index=True)
-        tmp = tmp.rename(columns={"rank": "value"})
+        pts = pd.DataFrame(records, columns=["iteration", "text", "value", "metric"])
 
         # Attach IDs
-        tmp = tmp.merge(
+        pts = pts.merge(
             df[["final_id", "text"]].drop_duplicates(subset="text"),
             on="text",
             how="left",
         )
 
-        # Precompute marker sizes: circle if object was sampled in that iteration
-        tmp["sampled"] = tmp.apply(
-            lambda r: (
-                6
-                if (
-                        (df["text"] == r["text"]) & (df["iteration"] == r["iteration"])
-                ).any()
-                else 0
-            ),
-            axis=1,
-        )
+        # Marker size: circle if the object was sampled in that iteration
+        sampled_pairs = pd.MultiIndex.from_arrays([df["text"], df["iteration"]])
+        pts_pairs = pd.MultiIndex.from_arrays([pts["text"], pts["iteration"]])
+        pts["sampled"] = np.where(pts_pairs.isin(sampled_pairs), 6, 0).astype(np.int8)
 
-        # Sort objects by first appearance rank for consistent line ordering
-        first_ranks = tmp.groupby("text")["value"].min().sort_values().index
-
-        fig = go.Figure()
-
-        first_iter = tmp.groupby("text")["iteration"].min()
-        # Map iteration categories to numeric indices
+        # Color by iteration of first appearance (normalized index into the colorscale)
+        iterations = np.sort(df["iteration"].unique())
         iter_to_idx = {it: i for i, it in enumerate(iterations)}
-        first_iter_idx = first_iter.map(iter_to_idx)
         n_colors = len(self.cs_iteration)
-        # Normalize first-iteration index → color
-        obj_color = {
-            text: self.cs_iteration[
-                int(idx / max(1, len(iterations) - 1) * (n_colors - 1))
-            ]
-            for text, idx in first_iter_idx.items()
-        }
-
-        for obj in first_ranks:
-            obj_df = tmp[tmp["text"] == obj].sort_values("iteration")
-
-            selected_mask = obj_df["final_id"].isin(selected_ids)
-            if not selected_ids:
-                selected_mask[:] = True
-            unselected_mask = ~selected_mask
-
-            for mask, opacity in [(selected_mask, 1), (unselected_mask, 0.1)]:
-                sub_df = obj_df[mask]
-                if sub_df.empty:
-                    continue
-
-                fig.add_trace(
-                    go.Scatter(
-                        x=sub_df["iteration"],
-                        y=sub_df["value"],
-                        mode="lines+markers",
-                        marker=dict(
-                            symbol="circle",
-                            size=sub_df["sampled"],
-                            color=obj_color[obj],
-                            coloraxis="coloraxis",
-                        ),
-                        line=dict(width=1),
-                        opacity=opacity,
-                        # name="1",#obj if opacity == 1 else f"{obj} (faded)",
-                        customdata=sub_df[
-                            ["final_id", "value", "metric", "text"]
-                        ].values,
-                        showlegend=False,
-                    )
-                )
-
-        # dummy legend trace
-        fig.add_trace(
-            go.Scatter(
-                x=[None],
-                y=[None],
-                mode="markers",
-                marker=dict(
-                    size=0,
-                    color=[df["iteration"].min(), df["iteration"].max()],
-                    colorscale=self.cs_iteration,
-                    cmin=df["iteration"].min(),
-                    cmax=df["iteration"].max(),
-                    showscale=True,
-                    colorbar=dict(
-                        title="Iteration of<br>First Sample",
-                    ),
-                ),
-                hoverinfo="none",
-                showlegend=False,
-            )
+        first_iter = pts.groupby("text")["iteration"].min()
+        color_idx = first_iter.map(
+            lambda it: int(iter_to_idx[it] / max(1, len(iterations) - 1) * (n_colors - 1))
         )
+        pts["color_idx"] = pts["text"].map(color_idx)
 
-        fig.update_traces(hoverinfo="none", hovertemplate=None)
+        # Order: by color, then by best rank (consistent line ordering), then along iterations
+        pts["best_rank"] = pts["text"].map(pts.groupby("text")["value"].min())
+        pts = pts.sort_values(["color_idx", "best_rank", "text", "iteration"], ignore_index=True)
 
-        fig.update_layout(
-            autosize=True,
-            title=(
-                f"Sample Ranking by {fo_metric}, {order} object has "
-                "highest rank<br><sup>"
+        return {"points": pts, "it_min": iterations.min(), "it_max": iterations.max()}
+
+    def bump_all_traces(self, prepared, selected_ids):
+        """
+        Traces for the cumulative bump chart. Objects sharing a color and selection state are
+        merged into one trace, separated by NaN gaps, so the number of traces is bounded by
+        2 * len(cs_iteration) instead of growing with the number of objects.
+
+        :param prepared: output of prepare_bump_all
+        :param selected_ids: list of final_ids to highlight
+        :return: list of trace dicts
+        """
+        pts = prepared["points"]
+        if selected_ids:
+            selected = pts["final_id"].isin(selected_ids).to_numpy()
+        else:
+            selected = np.ones(len(pts), dtype=bool)
+
+        traces = []
+        # Unselected (faded) first so that selected lines are drawn on top
+        for is_selected, opacity in [(False, 0.1), (True, 1)]:
+            sub = pts[selected == is_selected]
+            for color_idx, g in sub.groupby("color_idx", sort=True):
+                # Insert a gap before each new object
+                text = g["text"].to_numpy()
+                gaps = np.flatnonzero(text[1:] != text[:-1]) + 1
+                # float32 (exact for iterations/ranks) keeps the payload small; NaN marks gaps
+                x = np.insert(g["iteration"].to_numpy(dtype=np.float32), gaps, np.nan)
+                y = np.insert(g["value"].to_numpy(dtype=np.float32), gaps, np.nan)
+                size = np.insert(g["sampled"].to_numpy(), gaps, 0)
+                customdata = g[["final_id", "value", "metric", "text"]].to_numpy(dtype=object)
+                customdata = np.insert(customdata, gaps, None, axis=0)
+                color = self.cs_iteration[color_idx]
+                traces.append(dict(
+                    type="scatter",
+                    x=x,
+                    y=y,
+                    mode="lines+markers",
+                    marker=dict(symbol="circle", size=size, color=color),
+                    line=dict(width=1, color=color),
+                    opacity=opacity,
+                    customdata=customdata,
+                    showlegend=False,
+                    hoverinfo="none",
+                ))
+
+        # dummy trace for the colorbar
+        traces.append(dict(
+            type="scatter",
+            x=[None],
+            y=[None],
+            mode="markers",
+            marker=dict(
+                size=0,
+                color=[prepared["it_min"], prepared["it_max"]],
+                # explicit [[pos, color], ...]: raw trace dicts (Patch) are not converted by plotly.py
+                colorscale=make_colorscale(self.cs_iteration),
+                cmin=prepared["it_min"],
+                cmax=prepared["it_max"],
+                showscale=True,
+                colorbar=dict(title=dict(text="Iteration of<br>First Sample")),
+            ),
+            hoverinfo="none",
+            showlegend=False,
+        ))
+        return traces
+
+    @staticmethod
+    def bump_title(fo_metric, order, per_iter):
+        """Title of the bump chart."""
+        if per_iter:
+            sub = "For each Iteration the highest ranking objects of this iteration are shown."
+        else:
+            sub = (
                 "For each Iteration the highest ranking objects so far are shown, "
                 "objects from previous iterations persist as long as their rank is "
                 "high enough. "
                 "Markers show if an object was actually sampled in this iteration."
-                "</sup>"
-            ),
+            )
+        return f"Sample Ranking by {fo_metric}, {order} object has highest rank<br><sup>{sub}</sup>"
+
+    def bump_figure(self, traces, title):
+        """Wrap bump chart traces into a figure with the shared layout."""
+        fig = go.Figure(data=traces)
+        fig.update_layout(
+            autosize=True,
+            title=title,
             showlegend=True,
             legend=dict(orientation="h", yanchor="bottom", y=1.0, xanchor="left", x=0),
             xaxis_title="Iteration",
@@ -1704,70 +1696,89 @@ class Plotter:
             template=self.plotly_template,
             margin=dict(l=40, r=40, t=40, b=40),
         )
-
         fig.update_yaxes(autorange="reversed")
-
         return fig
 
-    def update_bump_iter(self, df, selected_ids, fo_metric, order):
+    def update_bump_all(self, df, n_top, selected_ids, fo_metric, order, prepared=None):
         """
-        Optimized bump chart update for cumulative top-ranked objects
-        where rewards are fixed but rank evolves as new objects appear.
+        Bump chart for cumulative top-ranked objects where rank evolves as new objects appear.
 
         :param df: prepared dataframe (should NOT include testset rows)
+        :param n_top: number of top objects to display
         :param selected_ids: list of final_ids to highlight
+        :param order: highest or lowest for highest/lowest rank
+        :param prepared: optional cached output of prepare_bump_all (df and n_top are then ignored)
         :return: Plotly figure
+        """
+        if prepared is None:
+            prepared = self.prepare_bump_all(df, n_top, order)
+        return self.bump_figure(
+            self.bump_all_traces(prepared, selected_ids),
+            self.bump_title(fo_metric, order, per_iter=False),
+        )
+
+    @staticmethod
+    def prepare_bump_iter(df):
+        """
+        Selection-independent part of the per-iteration bump chart: dense rank per iteration
+        after dropping duplicate objects. The result can be cached.
+
+        :param df: prepared dataframe (should NOT include testset rows)
+        :return: dataframe with columns iteration, text, metric, final_id, rank
         """
         df = df.drop_duplicates(subset=["iteration", "text", "metric"])
         df = df.rename(columns={"rank": "oldrank"})
-        df['rank'] = df.groupby('iteration')['oldrank'] \
-            .rank(method='dense', ascending=True).astype(int)
+        df["rank"] = df.groupby("iteration")["oldrank"].rank(method="dense", ascending=True).astype(int)
+        return df
 
+    def bump_iter_traces(self, prepared, selected_ids):
+        """
+        Trace for the per-iteration bump chart.
+
+        :param prepared: output of prepare_bump_iter
+        :param selected_ids: list of final_ids to highlight
+        :return: list with one trace dict
+        """
         if selected_ids:
-            df["opacity"] = df["final_id"].isin(selected_ids)*0.9 +0.1
+            opacity = prepared["final_id"].isin(selected_ids).to_numpy() * 0.9 + 0.1
         else:
-            df["opacity"] = 1
-
-        fig = go.Figure(
-            go.Scatter(
-                x=df['iteration'],
-                y=df['rank'],
-                mode='markers',
-                marker=dict(
-                    color=df['iteration'],
-                    colorscale=self.cs_iteration,
-                    colorbar=dict(title="Iteration of<br>First Sample"),
-                    symbol="square",
-                    line=dict(width=1, color="black"),
-                    size=10,
-                    opacity= df["opacity"]
-                ),
-                line=dict(width=1),
-                customdata=df[['final_id', 'rank', 'metric', 'text']].values,
-                showlegend=False
-            )
-        )
-
-        fig.update_traces(hoverinfo="none", hovertemplate=None)
-
-        fig.update_layout(
-            autosize=True,
-            title=(
-                f"Sample Ranking by {fo_metric}, {order} object has highest rank<br><sup>"
-                "For each Iteration the highest ranking objects of this iteration are shown."
-                "</sup>"
+            opacity = 1
+        return [dict(
+            type="scatter",
+            x=prepared["iteration"].to_numpy(),
+            y=prepared["rank"].to_numpy(),
+            mode="markers",
+            marker=dict(
+                color=prepared["iteration"].to_numpy(),
+                # explicit [[pos, color], ...]: raw trace dicts (Patch) are not converted by plotly.py
+                colorscale=make_colorscale(self.cs_iteration),
+                colorbar=dict(title=dict(text="Iteration of<br>First Sample")),
+                symbol="square",
+                line=dict(width=1, color="black"),
+                size=10,
+                opacity=opacity,
             ),
-            showlegend=True,
-            legend=dict(orientation="h", yanchor="bottom", y=1.0, xanchor="left", x=0),
-            xaxis_title="Iteration",
-            yaxis_title="Rank",
-            template=self.plotly_template,
-            margin=dict(l=40, r=40, t=40, b=40)
+            line=dict(width=1),
+            customdata=prepared[["final_id", "rank", "metric", "text"]].to_numpy(dtype=object),
+            showlegend=False,
+            hoverinfo="none",
+        )]
+
+    def update_bump_iter(self, df, selected_ids, fo_metric, order, prepared=None):
+        """
+        Bump chart showing the top-ranked objects of each iteration.
+
+        :param df: prepared dataframe (should NOT include testset rows)
+        :param selected_ids: list of final_ids to highlight
+        :param prepared: optional cached output of prepare_bump_iter (df is then ignored)
+        :return: Plotly figure
+        """
+        if prepared is None:
+            prepared = self.prepare_bump_iter(df)
+        return self.bump_figure(
+            self.bump_iter_traces(prepared, selected_ids),
+            self.bump_title(fo_metric, order, per_iter=True),
         )
-
-        fig.update_yaxes(autorange="reversed")
-
-        return fig
 
     def select_all_ids_from_ids(self, selected_ids, iterations):
         """

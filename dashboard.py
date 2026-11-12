@@ -1,6 +1,7 @@
 import warnings
+from functools import lru_cache
 import dash
-from dash import dcc, html, Input, Output, State, no_update, dash_table, ctx
+from dash import dcc, html, Input, Output, State, no_update, dash_table, ctx, Patch
 from dash.dash_table.Format import Format, Scheme
 import dash_cytoscape as cyto
 from plot_utils import *
@@ -947,6 +948,32 @@ def run_dashboard(
         Input("ranking-metric", "value"),
     )
     def bump_callback(iteration, selected_ids, fo_metric, rank_metric):
+        order = "highest" if "highest" in rank_metric else "lowest"
+        per_iter = "iter" in rank_metric
+        # Ranking is independent of the selection, so it is cached
+        prepared = bump_data(iteration[0], iteration[1], fo_metric, rank_metric)
+        if per_iter:
+            traces = plotter.bump_iter_traces(prepared, selected_ids)
+        else:
+            traces = plotter.bump_all_traces(prepared, selected_ids)
+        title = plotter.bump_title(fo_metric, order, per_iter)
+
+        # Only the selection changed: replace the traces, keep the layout
+        if set(ctx.triggered_prop_ids) == {"selected-objects.data"}:
+            patched = Patch()
+            patched["data"] = traces
+            patched["layout"]["title"]["text"] = title
+            # Remove the lasso/box outline, as a full figure update would
+            patched["layout"]["selections"] = []
+            return patched
+        return plotter.bump_figure(traces, title)
+
+    @lru_cache(maxsize=16)
+    def bump_data(it_min, it_max, fo_metric, rank_metric):
+        """
+        Load and rank the data for the bump chart. Cached; the trajectories table is not
+        modified while the dashboard runs. The returned object must not be mutated.
+        """
         n_top = 30
         order = "DESC" if "highest" in rank_metric else "ASC"
         conn = sqlite3.connect(data_path)
@@ -966,13 +993,13 @@ def run_dashboard(
                 WHERE rank <= {n_top}
                 ORDER BY iteration, rank;
             """
-        df = pd.read_sql_query(query, conn, params=iteration)
+        df = pd.read_sql_query(query, conn, params=(it_min, it_max))
         conn.close()
 
-        order = "highest" if "highest" in rank_metric else "lowest"
         if "iter" in rank_metric:
-            return plotter.update_bump_iter(df, selected_ids, fo_metric, order)
-        return plotter.update_bump_all(df, n_top, selected_ids, fo_metric, order)
+            return plotter.prepare_bump_iter(df)
+        order = "highest" if "highest" in rank_metric else "lowest"
+        return plotter.prepare_bump_all(df, n_top, order)
 
 
     # State Space Callback
