@@ -1,4 +1,5 @@
 import hashlib
+import json
 import heapq
 import os
 import sqlite3
@@ -54,6 +55,48 @@ def _table_columns(conn, table):
     return [row[1] for row in conn.execute(f"PRAGMA table_info({table})")]
 
 
+# Feature storage: one vector (BLOB) per final object, written by the logger
+# (see "Feature storage" in logger.py). The dashboard only reads it.
+
+def read_feature_info(conn):
+    """
+    Reads the feature info (names, dtype, testset_dtype).
+    :param conn: sqlite connection
+    :return: dict, empty if no features were stored
+    """
+    if not _table_columns(conn, "feature_info"):
+        return {}
+    info = dict(conn.execute("SELECT key, value FROM feature_info").fetchall())
+    if "names" in info:
+        info["names"] = json.loads(info["names"])
+    return info
+
+
+def decode_features(blobs, dtype):
+    """
+    Decodes feature vectors.
+    :param blobs: iterable of bytes, all of the same length
+    :param dtype: dtype the vectors were stored with (None if no features were stored)
+    :return: float32 np array (n_objects, n_features)
+    """
+    blobs = list(blobs)
+    if dtype is None or not blobs:
+        return np.zeros((len(blobs), 0), dtype=np.float32)
+    if len({len(b) for b in blobs}) != 1:
+        raise ValueError("Stored feature vectors have different lengths")
+    flat = np.frombuffer(b"".join(blobs), dtype=dtype)
+    return flat.reshape(len(blobs), -1).astype(np.float32)
+
+
+def old_feature_layout(conn):
+    """True if the db stores features in one column per feature (convert with migrate.py)."""
+    traj_cols = _table_columns(conn, "trajectories")
+    testset_cols = _table_columns(conn, "testset")
+    return "features_valid" in traj_cols or any(
+        c.startswith("f_") and c[2:].isdigit() for c in testset_cols
+    )
+
+
 class Plotter:
 
     def __init__(self, data, image_fn, state_aggregation_fn, s0):
@@ -62,21 +105,28 @@ class Plotter:
         self.image_fn = image_fn
         self.agg_fn = state_aggregation_fn
 
-        # schema: metric and feature columns of the logged data and the testset
+        # schema: metric columns of the logged data and the testset, feature storage
         conn = connect_ro(data)
+        if old_feature_layout(conn):
+            conn.close()
+            raise RuntimeError(
+                f"{data} stores features in one column per feature (old layout). "
+                f"Convert it first: python migrate.py {data}"
+            )
         traj_cols = _table_columns(conn, "trajectories")
         self.traj_cols = set(traj_cols)
         self.final_object_metrics = traj_cols[traj_cols.index("total_reward"): traj_cols.index("logprobs_forward")]
-        self.feature_cols = traj_cols[traj_cols.index("features_valid") + 1:]
+        self.has_features = bool(_table_columns(conn, "features"))
+        feature_info = read_feature_info(conn)
+        self.feature_dtype = feature_info.get("dtype")
+        self.testset_feature_dtype = feature_info.get("testset_dtype")
         testset_cols = _table_columns(conn, "testset")
         self.testset_cols = set(testset_cols)
         if testset_cols:
             self.testset_metrics = testset_cols[testset_cols.index("total_reward"): testset_cols.index("features_valid")]
-            self.feature_cols_testset = [c for c in testset_cols if c.startswith("f_") and c[2:].isdigit()]
             self.has_testset = conn.execute("SELECT EXISTS (SELECT 1 FROM testset)").fetchone()[0] == 1
         else:
             self.testset_metrics = []
-            self.feature_cols_testset = []
             self.has_testset = False
         conn.close()
 
@@ -677,69 +727,70 @@ class Plotter:
 
     def _compute_projection(self, iteration, use_testset, method, param_value):
         conn = connect_ro(self.data)
-        feature_sql = ", ".join(quote_ident(c, self.traj_cols) for c in self.feature_cols)
         metric_sql = ", ".join(quote_ident(c, self.traj_cols) for c in self.final_object_metrics)
+        metric_sql_outer = ", ".join(f"t.{quote_ident(c, self.traj_cols)}" for c in self.final_object_metrics)
+        if self.has_features:
+            feature_join = "LEFT JOIN features f ON f.final_id = t.final_id"
+            feature_cols = "f.features_valid, f.vec"
+        else:
+            feature_join = ""
+            feature_cols = "NULL AS features_valid, NULL AS vec"
 
-        # Get logged data (unique texts, latest iteration)
+        # Get logged data (unique texts, latest iteration) and their feature vectors
         query = f"""
                     SELECT
-                        final_id AS id,
-                        text,
-                        {feature_sql},
-                        {metric_sql},
-                        iteration,
-                        features_valid
+                        t.final_id AS id,
+                        t.text,
+                        {metric_sql_outer},
+                        t.iteration,
+                        {feature_cols}
                     FROM (
-                        SELECT *,
+                        SELECT
+                            final_id,
+                            text,
+                            {metric_sql},
+                            iteration,
                             ROW_NUMBER() OVER (
                                 PARTITION BY text
                                 ORDER BY iteration DESC
                             ) AS rn
-                        FROM (
-                            SELECT
-                                final_id,
-                                text,
-                                {feature_sql},
-                                {metric_sql},
-                                iteration,
-                                final_object,
-                                features_valid
-                            FROM trajectories
-                            WHERE iteration BETWEEN ? AND ?
-                        ) t
-                        WHERE final_object = 1
-                    )
-                    WHERE rn = 1
+                        FROM trajectories
+                        WHERE iteration BETWEEN ? AND ?
+                          AND final_object = 1
+                    ) t
+                    {feature_join}
+                    WHERE t.rn = 1
                 """
         logged = pd.read_sql_query(query, conn, params=iteration)
         logged = logged[logged["features_valid"] == 1]
-        query = """
-                    SELECT COUNT(*) AS count
-                    FROM trajectories
-                    WHERE final_object = 1
-                    AND iteration BETWEEN ? AND ?
-                    AND features_valid = 0
-                """
-        non_valid = pd.read_sql_query(query, conn, params=iteration)["count"][0]
-        if non_valid:
-            print(f"""
-                        {non_valid} objects of the logged data have not been
-                        downprojected due to invalid features.
-                        """)
+        if self.has_features:
+            query = """
+                        SELECT COUNT(*) AS count
+                        FROM trajectories t
+                        JOIN features f ON f.final_id = t.final_id
+                        WHERE t.final_object = 1
+                        AND t.iteration BETWEEN ? AND ?
+                        AND f.features_valid = 0
+                    """
+            non_valid = pd.read_sql_query(query, conn, params=iteration)["count"][0]
+            if non_valid:
+                print(f"""
+                            {non_valid} objects of the logged data have not been
+                            downprojected due to invalid features.
+                            """)
 
-        features = logged[self.feature_cols].to_numpy()
-        df_dp = logged.drop(columns=self.feature_cols)
+        features = decode_features(logged["vec"], self.feature_dtype)
+        df_dp = logged.drop(columns=["vec"]).reset_index(drop=True)
 
         # Get testset data
         if use_testset and self.has_testset:
-            feature_sql_t = ", ".join(quote_ident(c, self.testset_cols) for c in self.feature_cols_testset)
             metric_sql_t = ", ".join(quote_ident(c, self.testset_cols) for c in self.testset_metrics)
             query = f"""
                         SELECT
                             id,
                             text,
-                            {feature_sql_t},
-                            {metric_sql_t}
+                            {metric_sql_t},
+                            features
                         FROM testset
                         WHERE features_valid = 1
                     """
@@ -753,12 +804,12 @@ class Plotter:
                         """)
 
             # concat features
-            features_t = testset[self.feature_cols_testset].to_numpy()
-            testset = testset.drop(columns=self.feature_cols_testset)
+            features_t = decode_features(testset["features"], self.testset_feature_dtype)
+            testset = testset.drop(columns=["features"])
             assert features.shape[1] == features_t.shape[1], f"""
                             Testset and Logged data have a different amout of features.\n
-                            Testset: {self.feature_cols_testset}
-                            Logged: {self.feature_cols}
+                            Testset: {features_t.shape[1]}
+                            Logged: {features.shape[1]}
                         """
             features = np.concatenate((features, features_t), axis=0)
             df_dp = pd.concat([df_dp, testset], axis=0, ignore_index=True)

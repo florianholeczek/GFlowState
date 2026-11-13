@@ -7,6 +7,7 @@ import os
 import torch
 import numpy as np
 from graphdbs_from_db import create_graph_dbs
+import json
 
 """
 Use the provided logger to log n on-policy samples every m iterations.
@@ -53,6 +54,188 @@ Scalability:
     Rule of thumb: 1000 samples at 20 timepoints during training should work fine for trajectories below length 50.
 """
 
+# ================= Feature storage =================
+# Features are only stored for final objects (the dashboard only projects these),
+# one row per object in the table
+#     features(final_id INTEGER PRIMARY KEY, features_valid INTEGER, vec BLOB)
+# vec holds the whole feature vector as raw bytes: the logged features first, then the
+# computed ones. The testset stores its vectors the same way in the BLOB column
+# testset.features.
+# The table feature_info holds the feature names and the dtype of the vectors:
+# uint8 if all values are integers in [0, 255] (e.g. fingerprints), otherwise float32.
+# If a later batch does not fit uint8, the stored vectors are converted to float32.
+# One BLOB per object avoids SQLite's limit of 2000 columns per table and keeps the
+# database small. The dashboard reads it with decode_features() in plot_utils.py.
+# Databases with the old layout (one column per feature) are converted by migrate.py.
+
+FEATURES_UINT8 = "uint8"
+FEATURES_FLOAT32 = "float32"
+
+OLD_LAYOUT_MSG = (
+    "{db} stores features in one column per feature (old layout). "
+    "Convert it first: python migrate.py {db}"
+)
+
+_FEATURES_TABLE = """
+    CREATE TABLE IF NOT EXISTS features (
+        final_id INTEGER PRIMARY KEY,
+        features_valid INTEGER NOT NULL,
+        vec BLOB
+    )
+"""
+_FEATURE_INFO_TABLE = "CREATE TABLE IF NOT EXISTS feature_info (key TEXT PRIMARY KEY, value TEXT)"
+
+
+def features_to_matrix(x):
+    """
+    Converts features (np array, torch Tensor or nested list) to a 2D np array.
+    :param x: features of shape (n_objects, n_features)
+    :return: np array
+    """
+    if isinstance(x, torch.Tensor):
+        x = x.detach().cpu().numpy()
+    x = np.asarray(x)
+    if x.ndim == 1:
+        x = x.reshape(-1, 1)
+    return x
+
+
+def choose_feature_dtype(matrix):
+    """
+    uint8 if all values are integers in [0, 255], otherwise float32.
+    :param matrix: np array
+    :return: dtype name
+    """
+    m = np.asarray(matrix)
+    if m.dtype == bool:
+        return FEATURES_UINT8
+    m = m.astype(np.float64)
+    if m.size == 0:
+        return FEATURES_UINT8
+    if np.isfinite(m).all() and m.min() >= 0 and m.max() <= 255 and (m == np.round(m)).all():
+        return FEATURES_UINT8
+    return FEATURES_FLOAT32
+
+
+def wider_feature_dtype(a, b):
+    """The dtype that can hold values of both dtypes."""
+    return FEATURES_FLOAT32 if FEATURES_FLOAT32 in (a, b) else FEATURES_UINT8
+
+
+def encode_features(matrix, dtype):
+    """
+    Encodes each row of the matrix as raw bytes.
+    :param matrix: np array (n_objects, n_features)
+    :param dtype: uint8 or float32
+    :return: list of bytes
+    """
+    m = np.ascontiguousarray(np.asarray(matrix).astype(dtype))
+    return [row.tobytes() for row in m]
+
+
+def read_feature_info(conn):
+    """
+    Reads the feature info (names, dtype, testset_dtype).
+    :param conn: sqlite connection
+    :return: dict, empty if no features were stored
+    """
+    exists = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='feature_info'"
+    ).fetchone()
+    if not exists:
+        return {}
+    info = dict(conn.execute("SELECT key, value FROM feature_info").fetchall())
+    if "names" in info:
+        info["names"] = json.loads(info["names"])
+    return info
+
+
+def ensure_feature_tables(conn):
+    """Creates the features and feature_info tables if they do not exist."""
+    conn.execute(_FEATURES_TABLE)
+    conn.execute(_FEATURE_INFO_TABLE)
+
+
+def set_feature_info(conn, key, value):
+    """Stores a feature info entry (names are stored as JSON)."""
+    if key == "names":
+        value = json.dumps(list(value))
+    conn.execute("INSERT OR REPLACE INTO feature_info (key, value) VALUES (?, ?)", (key, value))
+
+
+def _convert_stored_features(conn, table, id_col, blob_col, old, new):
+    """Re-encodes the stored vectors of a table with a wider dtype."""
+    rows = conn.execute(
+        f"SELECT {id_col}, {blob_col} FROM {table} WHERE {blob_col} IS NOT NULL"
+    ).fetchall()
+    conn.executemany(
+        f"UPDATE {table} SET {blob_col} = ? WHERE {id_col} = ?",
+        [(np.frombuffer(b, dtype=old).astype(new).tobytes(), i) for i, b in rows],
+    )
+
+
+def write_features(conn, final_ids, features_valid, matrix, names):
+    """
+    Appends the feature vectors of final objects to the features table.
+    Does not commit.
+    :param conn: sqlite connection
+    :param final_ids: final ids of the objects (as stored in trajectories)
+    :param features_valid: bool per object
+    :param matrix: features, shape (n_objects, n_features)
+    :param names: feature names, must be the same for every batch
+    :return: None
+    """
+    ensure_feature_tables(conn)
+    info = read_feature_info(conn)
+    names = list(names)
+    if "names" in info and info["names"] != names:
+        raise ValueError(f"Features differ from the ones logged before: {names} vs {info['names']}")
+    dtype = choose_feature_dtype(matrix)
+    if "dtype" in info:
+        new = wider_feature_dtype(info["dtype"], dtype)
+        if new != info["dtype"]:
+            _convert_stored_features(conn, "features", "final_id", "vec", info["dtype"], new)
+        dtype = new
+    set_feature_info(conn, "names", names)
+    set_feature_info(conn, "dtype", dtype)
+    rows = zip(
+        (int(i) for i in final_ids),
+        (int(bool(v)) for v in features_valid),
+        encode_features(matrix, dtype),
+    )
+    conn.executemany("INSERT INTO features (final_id, features_valid, vec) VALUES (?, ?, ?)", rows)
+
+
+def encode_testset_features(conn, matrix, testset_exists):
+    """
+    Encodes testset feature vectors, converting already stored testset vectors to a
+    wider dtype if needed. Does not commit.
+    :param conn: sqlite connection
+    :param matrix: features, shape (n_objects, n_features)
+    :param testset_exists: whether the testset table exists already
+    :return: list of bytes, one per object
+    """
+    conn.execute(_FEATURE_INFO_TABLE)
+    info = read_feature_info(conn)
+    dtype = choose_feature_dtype(matrix)
+    if "testset_dtype" in info:
+        new = wider_feature_dtype(info["testset_dtype"], dtype)
+        if new != info["testset_dtype"] and testset_exists:
+            _convert_stored_features(conn, "testset", "id", "features", info["testset_dtype"], new)
+        dtype = new
+    set_feature_info(conn, "testset_dtype", dtype)
+    return encode_features(matrix, dtype)
+
+
+def old_feature_layout(conn):
+    """True if the db stores features in one column per feature (convert with migrate.py)."""
+    traj_cols = [r[1] for r in conn.execute("PRAGMA table_info(trajectories)")]
+    testset_cols = [r[1] for r in conn.execute("PRAGMA table_info(testset)")]
+    return "features_valid" in traj_cols or any(
+        c.startswith("f_") and c[2:].isdigit() for c in testset_cols
+    )
+
+
 class VisLogger:
     def __init__(
             self,
@@ -76,12 +259,14 @@ class VisLogger:
             s0 will be specified as '#' in the visualizations, make sure no state has the same identifier.
         :param fn_compute_features: Optional.
             Function to compute features from the states.
+            It is only called with the final states (the objects) of each batch.
             Should take the states in the same format as given (torch Tensor, np array or list)
             and return a tuple consisting of:
-                1. A np array of size (sum(trajectory_lengths), n_features) containing the features
+                1. A np array or tensor of size (n_states, n_features) containing the features
                 2. A list(bool) that tells for each state if the feature computation was successful.
-                Unsuccessful states are skipped in the trajectory visualizations
+                Objects with unsuccessful feature computation are not projected.
             These will be used for the downprojections.
+            Features are stored as one vector per final object (see "Feature storage" above).
             Additional features can also be logged with the features parameter
         :param metrics: Optional.
             Names of additional metrics for final objects. Might be different losses or rewards.
@@ -120,8 +305,6 @@ class VisLogger:
             *(metrics if metrics is not None else []),
             'logprobs_forward',
             'logprobs_backward',
-            'features_valid_provided',
-            *(features if features is not None else [])
         ]
         self.df = pd.DataFrame(columns=self.cols)
 
@@ -211,7 +394,7 @@ class VisLogger:
             Flags if the provided features are valid. Otherwise they are ignored.
         :param features: Optional. Additionally logged features based on the initialized features.
             A torch Tensor or np array of shape (sum(trajectory_lengths), len(features)) or
-            a nested list of the same shape.
+            a nested list of the same shape. Only the rows of the final states are stored.
         :return: None
         """
 
@@ -329,15 +512,6 @@ class VisLogger:
             ar[last] = self.current[m]
             data[m] = ar
 
-        # rename
-        #data.rename(columns={"total_reward": "total_reward", "loss": "loss"}, inplace=True)
-
-        # add provided features
-        if self.features is not None:
-            data["features_valid_provided"] = self.current["features_valid_provided"]
-            for i in self.features:
-                data[i] = self.current[i]
-
         # compute texts
         data["text"] = self.fn_state_to_text(self.current["states"])
 
@@ -364,23 +538,25 @@ class VisLogger:
         )
         data = last_rows.merge(logprob_sums, on=["final_id", "text"], how="left")
 
-        #compute features
-        feature_cols = None
-        if self.fn_compute_features is not None:
-            features, features_valid = self.fn_compute_features(
-                self.__select_states__(data["state_idx"].to_numpy())
+        # features of the final objects (the dashboard only projects these):
+        # logged features first, then computed ones
+        finals = data[data["final_object"].astype(bool)]
+        final_idx = finals["state_idx"].to_numpy()
+        feature_parts, feature_names = [], []
+        features_valid = np.ones(len(finals), dtype=bool)
+        if self.features is not None:
+            feature_parts.append(
+                np.column_stack([np.asarray(self.current[n])[final_idx] for n in self.features])
             )
-            data["features_valid_computed"] = features_valid
-            feature_cols = [f"computed_features_{i}" for i in range(features.shape[1])]
-            features_df = pd.DataFrame(features, columns=feature_cols, index=data.index)
-            data = pd.concat([data, features_df], axis=1)
+            feature_names += list(self.features)
+            features_valid &= np.asarray(self.current["features_valid_provided"], dtype=bool)[final_idx]
+        if self.fn_compute_features is not None:
+            computed, computed_valid = self.fn_compute_features(self.__select_states__(final_idx))
+            computed = features_to_matrix(computed)
+            feature_parts.append(computed)
+            feature_names += [f"computed_features_{i}" for i in range(computed.shape[1])]
+            features_valid &= features_to_matrix(computed_valid).astype(bool).reshape(-1)
 
-        # combine features_valid
-        if self.features is None:
-            data["features_valid_provided"] = True
-        if "features_valid_computed" not in data.columns:
-            data["features_valid_computed"] = True
-        data["features_valid"] = data["features_valid_provided"] & data["features_valid_computed"]
         column_list = [
             "final_id",
             "text",
@@ -392,11 +568,9 @@ class VisLogger:
             *(self.metrics if self.metrics is not None else []),
             "logprobs_forward",
             "logprobs_backward",
-            "features_valid",
-            *(self.features if self.features is not None else []),
-            *(feature_cols if feature_cols is not None else []),
         ]
         data = data[column_list]
+        final_ids = finals["final_id"].to_numpy()
 
         # create db if not existing, shift final ids and save to db
         conn = sqlite3.connect(self.db)
@@ -404,16 +578,25 @@ class VisLogger:
         query = "SELECT name FROM sqlite_master WHERE type='table' AND name='trajectories'"
         cur.execute(query)
         table_exists = cur.fetchone() is not None
+        if old_feature_layout(conn):
+            conn.close()
+            raise RuntimeError(OLD_LAYOUT_MSG.format(db=self.db))
         if table_exists:
             query = "SELECT COALESCE(MAX(final_id), 0) AS max FROM trajectories"
             offset = pd.read_sql_query(query, conn)["max"][0]
             data["final_id"] = data["final_id"] + offset + 1
+            final_ids = final_ids + offset + 1
         data.to_sql(
             "trajectories",
             conn,
             if_exists="append",
             index=False
         )
+        if feature_parts:
+            write_features(
+                conn, final_ids, features_valid, np.column_stack(feature_parts), feature_names
+            )
+            conn.commit()
 
         # indexing
         if not table_exists:
@@ -477,12 +660,7 @@ class VisLogger:
         if metrics is not None:
             for k,v in metrics.items():
                 df[k] = v
-        df["features_valid"] = features_valid
-        new_cols = {
-            f"f_{i}": f
-            for i, f in enumerate(features)
-        }
-        df = pd.concat([df, pd.DataFrame(new_cols, index=df.index)], axis=1)
+        df["features_valid"] = features_to_matrix(features_valid).astype(bool).reshape(-1)
         df.insert(0, "id", -df.index-1)
 
         # create db or append to it
@@ -490,6 +668,14 @@ class VisLogger:
         cur = conn.cursor()
         cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='testset'")
         table_exists = cur.fetchone() is not None
+        if old_feature_layout(conn):
+            conn.close()
+            raise RuntimeError(OLD_LAYOUT_MSG.format(db=self.db))
+
+        # one feature vector (BLOB) per object, features are given as (n_features, chunksize)
+        df["features"] = encode_testset_features(
+            conn, features_to_matrix(features).T, table_exists
+        )
         if table_exists:
             existing_cols = {
                 row[1] for row in cur.execute("PRAGMA table_info(testset)")
@@ -512,7 +698,8 @@ class VisLogger:
             "testset",
             conn,
             if_exists="append",
-            index=False
+            index=False,
+            dtype={"features": "BLOB"},
         )
 
         # create indices the first time
@@ -520,6 +707,7 @@ class VisLogger:
         if not table_exists:
             cur.execute("CREATE INDEX idx_testset_text ON testset(text)")
             cur.execute("CREATE INDEX idx_testset_reward ON testset(total_reward)")
+        conn.commit()
         conn.close()
 
 

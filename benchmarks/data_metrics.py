@@ -110,8 +110,12 @@ def data_metrics(conn):
         ),
     }
     cols = [r[1] for r in conn.execute("PRAGMA table_info(trajectories)")]
-    if "features_valid" in cols:
+    if "features_valid" in cols:  # old layout: one column per feature
         res["feature_dims"] = len(cols) - cols.index("features_valid") - 1
+    elif table_exists(conn, "feature_info"):  # one feature vector (BLOB) per object
+        names = conn.execute("SELECT value FROM feature_info WHERE key = 'names'").fetchone()
+        if names:
+            res["feature_dims"] = len(json.loads(names[0]))
     return res
 
 
