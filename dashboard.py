@@ -78,27 +78,12 @@ def run_dashboard(
 
     plotter = Plotter(data_path, image_fn, agg_fn, s0)
 
-    # get provided metrics and feature columns
-    conn = sqlite3.connect(data_path)
-    data_cols = pd.read_sql_query("SELECT name FROM pragma_table_info('trajectories');", conn)["name"].tolist()
-    final_object_metrics = data_cols[data_cols.index("total_reward"): data_cols.index("logprobs_forward")]
-    feature_cols = data_cols[data_cols.index("features_valid")+1:]
-
-    # create empty testset if it is missing and get column names
-    cur = conn.cursor()
-    cur.execute(f"""
-            CREATE TABLE IF NOT EXISTS testset (
-                id INT,
-                text TEXT,
-                total_reward REAL,
-                features_valid REAL
-            )
-        """)
-    testset_cols = pd.read_sql_query("SELECT name FROM pragma_table_info('testset');", conn)["name"].tolist()
-    feature_cols_testset = [c for c in testset_cols if c.startswith("f_") and c[2:].isdigit()]
-    testset_metrics = testset_cols[testset_cols.index("total_reward"): testset_cols.index("features_valid")]
+    # provided metrics (read from the db schema, also used as whitelist for SQL column names)
+    final_object_metrics = plotter.final_object_metrics
+    testset_metrics = plotter.testset_metrics
 
     # get iteration range
+    conn = connect_ro(data_path)
     query = "SELECT MIN(iteration) AS min, MAX(iteration) AS max FROM trajectories"
     iteration_range = pd.read_sql_query(query, conn)
     iteration_step = iteration_range["max"][0] - iteration_range["min"][0]
@@ -110,7 +95,6 @@ def run_dashboard(
     for i in iteration_marks:
         iteration_marks_dict[i] = str(i)
 
-    conn.commit()
     conn.close()
 
     app = dash.Dash(__name__)
@@ -124,7 +108,6 @@ def run_dashboard(
         dcc.Store(id="max-frequency", data= 0),
         dcc.Store(id="dag-overview-tid-list", data= []),
         dcc.Store(id="dag-overview-edge-list", data= []),
-        dcc.Store(id="hexbin-size", data=8),
         dcc.Store(id="dag-overview-page", data=0),
         dcc.Store(id="dag-fit-dummy"),
 
@@ -759,9 +742,12 @@ def run_dashboard(
         State("build-ids", "data"),
         State("dag-overview-tid-list", "data"),
         State("iteration", "value"),
+        State("projection-method", "value"),
+        State("projection-param", "value"),
+        State("use-testset", "value"),
         prevent_initial_call=True
     )
-    def update_selected_objects(clear_clicks, ss_select, ss_click, bump_select, dag_node, selected_tids, current_ids, build_ids, tid_list, iterations):
+    def update_selected_objects(clear_clicks, ss_select, ss_click, bump_select, dag_node, selected_tids, current_ids, build_ids, tid_list, iterations, method, param_value, use_testset):
 
         ctx = dash.callback_context
         if not ctx.triggered:
@@ -789,9 +775,9 @@ def run_dashboard(
                 return no_update
 
             _, hex_q, hex_r, _, _, _ = ss_click["points"][0]["customdata"]
-            conn = sqlite3.connect(data_path)
-            query = f"SELECT id FROM current_dp WHERE hex_q = ? AND hex_r = ?"
-            selected_ids = pd.read_sql_query(query, conn, params=[hex_q, hex_r])["id"].tolist()
+            dp, _ = plotter.get_projection(iterations, use_testset, method, param_value)
+            in_hex = (dp["hex_q"] == int(hex_q)) & (dp["hex_r"] == int(hex_r))
+            selected_ids = dp.loc[in_hex, "id"].astype(int).tolist()
             selected_ids = plotter.select_all_ids_from_ids(selected_ids, iterations)
 
             return selected_ids, None, []
@@ -820,10 +806,13 @@ def run_dashboard(
             # expand dag, build table
             if dag_node.get("node_type") == 'handler':
                 text = dag_node.get("id")[8:]
-                conn = sqlite3.connect(data_path)
+                # node data comes back from the client: validate before it reaches SQL
+                node_metric = check_choice(dag_node.get("metric"), DAG_METRICS, "DAG metric")
+                node_direction = check_choice(dag_node.get("direction"), DIRECTIONS, "direction")
+                conn = connect_ro(data_path)
 
-                if dag_node.get("metric") in ["highest", "lowest", "variance"]:
-                    col = "logprobs_" + dag_node.get("direction")
+                if node_metric in ["highest", "lowest", "variance"]:
+                    col = "logprobs_" + node_direction
                     query = f"""
                         WITH ranked AS (
                             SELECT
@@ -858,7 +847,7 @@ def run_dashboard(
                         """
                 children_e = pd.read_sql_query(query, conn, params=[text, iteration0, iteration1])
 
-                if dag_node.get("metric") == "variance":
+                if node_metric == "variance":
                     children_e["latest_logprobs"] -= children_e["avg_logprobs"]
                 children_e.rename(columns={"target": "id", "latest_logprobs": "logprobs"}, inplace=True)
                 children_e = children_e[["id", "logprobs"]]
@@ -898,7 +887,7 @@ def run_dashboard(
             # selected trajectories
             else:
                 text = dag_node.get("id")
-                conn = sqlite3.connect(data_path)
+                conn = connect_ro(data_path)
                 query = f"""
                             SELECT DISTINCT
                                 trajectory_id
@@ -922,7 +911,7 @@ def run_dashboard(
 
 
             # get trajectory ids that are also in iteration range and then all node ids for these trajectory_ids
-            conn = sqlite3.connect(data_path)
+            conn = connect_ro(data_path)
             placeholders = ",".join("?" for _ in t_ids)
             query = f"""
             SELECT DISTINCT trajectory_id
@@ -975,17 +964,19 @@ def run_dashboard(
         modified while the dashboard runs. The returned object must not be mutated.
         """
         n_top = 30
+        check_choice(rank_metric, RANK_METRICS, "ranking metric")
+        fo_col = quote_ident(fo_metric, final_object_metrics)
         order = "DESC" if "highest" in rank_metric else "ASC"
-        conn = sqlite3.connect(data_path)
+        conn = connect_ro(data_path)
         query = f"""
                 SELECT iteration, text, metric, final_id, rank
                 FROM (
                     SELECT
                         iteration,
                         text,
-                        {fo_metric} as metric,
+                        {fo_col} as metric,
                         final_id,
-                        ROW_NUMBER() OVER (PARTITION BY iteration ORDER BY {fo_metric} {order}) AS rank
+                        ROW_NUMBER() OVER (PARTITION BY iteration ORDER BY {fo_col} {order}) AS rank
                     FROM trajectories
                     WHERE iteration BETWEEN ? AND ?
                     AND final_object = 1
@@ -1005,7 +996,6 @@ def run_dashboard(
     # State Space Callback
     @app.callback(
         Output("state-space-plot", "figure"),
-        Output("hexbin-size", "data"),
         Input("selected-objects", "data"),
         Input("projection-method", "value"),
         Input("projection-param", "value"),
@@ -1013,43 +1003,21 @@ def run_dashboard(
         Input("use-testset", "value"),
         Input("fo-metric", "value"),
         Input("state-space-style", "value"),
-        State("hexbin-size", "data"),
     )
-    def update_projection_plots(selected_ids, method, param_value, iteration, use_testset, metric, ss_style, hexbin_size):
+    def update_projection_plots(selected_ids, method, param_value, iteration, use_testset, metric, ss_style):
         ctx = dash.callback_context
         if not ctx.triggered:
-            return no_update, no_update
-        trigger = ctx.triggered[0]["prop_id"]
-        metric_lists = (final_object_metrics, testset_metrics)
-        new_hexbin_size = hexbin_size
+            return no_update
+        check_choice(ss_style, (*HEX_STYLES, "Scatter"), "state space style")
 
-        # fetch from db
-        if trigger == "selected-objects.data" or trigger == "fo-metric.value" or trigger == "state-space-style.value":
-            conn = sqlite3.connect(data_path)
-            if "Hex" in ss_style:
-                df = plotter.get_hexbin_data(conn, ss_style, metric)
-            else:
-                df = pd.read_sql_query(f"SELECT id, x, y, hex_q, hex_r, text, iteration, istestset, {', '.join(final_object_metrics)} FROM current_dp", conn)
-            conn.close()
-        else:
-            #downproject and write to db
-            df, new_hexbin_size = plotter.create_dp_table(
-                feature_cols,
-                iteration,
-                use_testset,
-                feature_cols_testset,
-                method,
-                param_value,
-                metric_lists
-            )
-            if "Hex" in ss_style:
-                conn = sqlite3.connect(data_path)
-                df = plotter.get_hexbin_data(conn, ss_style, metric)
-                conn.close()
+        # downprojection, cached for all sessions (only computed if the inputs are new)
+        dp, hexbin_size = plotter.get_projection(iteration, use_testset, method, param_value)
 
         if "Hex" in ss_style:
-            return plotter.update_hex(df, selected_ids, ss_style, metric, use_testset, new_hexbin_size), new_hexbin_size
-        return plotter.update_state_space(df, selected_ids, metric), new_hexbin_size
+            df = plotter.get_hexbin_data(dp, ss_style, metric)
+            return plotter.update_hex(df, dp, selected_ids, ss_style, metric, use_testset, hexbin_size)
+        cols = ["id", "x", "y", "hex_q", "hex_r", "text", "iteration", "istestset", *final_object_metrics]
+        return plotter.update_state_space(dp[cols].copy(), selected_ids, metric)
 
 
 
@@ -1072,7 +1040,7 @@ def run_dashboard(
         add_handlers = True
         if selected_objects:
             # If final objects are selected via another vis, display the full dag of these
-            conn = sqlite3.connect(data_path)
+            conn = connect_ro(data_path)
             placeholders = ",".join("?" for _ in selected_objects)
             query = f"""
                         SELECT DISTINCT
@@ -1182,9 +1150,12 @@ def run_dashboard(
         Input("state-space-plot", "hoverData"),
         State("fo-metric", "value"),
         State("state-space-style", "value"),
-        State("use-testset", "value")
+        State("use-testset", "value"),
+        State("iteration", "value"),
+        State("projection-method", "value"),
+        State("projection-param", "value"),
     )
-    def display_image_tooltip1(hoverData, metric, ss_style, usetestset):
+    def display_image_tooltip1(hoverData, metric, ss_style, usetestset, iteration, method, param_value):
         if hoverData is None:
             return False, None, None
         bbox = hoverData["points"][0]["bbox"]
@@ -1208,7 +1179,9 @@ def run_dashboard(
                     metric_title = f"Correlation log reward and logprobs: {metric_value:.2f}"
 
 
+            dp, _ = plotter.get_projection(iteration, usetestset, method, param_value)
             figures, texts = plotter.hex_hover_figures(
+                dp,
                 hex_q,
                 hex_r,
                 metric,
@@ -1320,7 +1293,7 @@ def run_dashboard(
         source, target = edge_list[idx]
 
         # get data
-        conn = sqlite3.connect(data_path)
+        conn = connect_ro(data_path)
         query = "SELECT DISTINCT iteration, logprobs_forward, logprobs_backward FROM edges WHERE source = ? AND target = ?"
         edge_data = pd.read_sql_query(query, conn, params=[source, target])
         conn.close()
@@ -1396,6 +1369,8 @@ def run_dashboard(
     )
     def dag_overview_buttons(top, nxt, prev, iterations, metric, page):
         trigger = dash.callback_context.triggered[0]["prop_id"]
+        check_choice(metric, DAG_METRICS, "DAG metric")
+        page = max(int(page or 0), 0)
         if "top" in trigger or "iteration" in trigger or "metric" in trigger:
             page = 0
         elif "prev" in trigger:
@@ -1403,7 +1378,7 @@ def run_dashboard(
         elif "next" in trigger:
             page += 1
         disabled_top = page ==0
-        conn = sqlite3.connect(data_path)
+        conn = connect_ro(data_path)
         if metric == "variance":
             query = """
                 SELECT COUNT(*) AS count
@@ -1419,6 +1394,7 @@ def run_dashboard(
             query = "SELECT COUNT(*) AS count FROM (SELECT DISTINCT source, target FROM edges WHERE iteration BETWEEN ? AND ?);"
 
         n_edges = pd.read_sql_query(query, conn, params=iterations)["count"].tolist()[0]
+        conn.close()
         disabled_bottom = (page+1)*150 >= n_edges
         return page, disabled_top, disabled_top, disabled_bottom
 

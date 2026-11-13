@@ -1,5 +1,11 @@
+import hashlib
 import heapq
+import os
 import sqlite3
+import tempfile
+from pathlib import Path
+
+import diskcache
 import pandas as pd
 import numpy as np
 import plotly.graph_objects as go
@@ -11,6 +17,43 @@ from umap import UMAP
 from dash import html
 
 
+# Allowed values for client-supplied choices that end up in SQL
+DIRECTIONS = ("forward", "backward")
+DAG_METRICS = ("highest", "lowest", "variance", "frequency")
+PROJECTION_METHODS = ("tsne", "umap")
+HEX_STYLES = ("Hex Ratio", "Hex Obj. Metric", "Hex Correlation")
+RANK_METRICS = ("highest over all", "highest per iter", "lowest over all", "lowest per iter")
+
+
+def connect_ro(path):
+    """
+    Open the data db read-only. The dashboard never writes to it.
+    TEMP tables still work, they live outside the db file and are private to the connection.
+    """
+    return sqlite3.connect(f"{Path(path).resolve().as_uri()}?mode=ro", uri=True)
+
+
+def check_choice(value, allowed, what):
+    """Raise if a client-supplied value is not one of the allowed ones."""
+    if value not in allowed:
+        raise ValueError(f"Invalid {what}: {value!r}")
+    return value
+
+
+def quote_ident(name, allowed):
+    """
+    Quote a column name for use in SQL. Only names from `allowed` (taken from the db schema)
+    are accepted, so client-supplied names can not inject SQL.
+    """
+    check_choice(name, allowed, "column name")
+    return '"' + str(name).replace('"', '""') + '"'
+
+
+def _table_columns(conn, table):
+    """Column names of a table, empty list if the table does not exist."""
+    return [row[1] for row in conn.execute(f"PRAGMA table_info({table})")]
+
+
 class Plotter:
 
     def __init__(self, data, image_fn, state_aggregation_fn, s0):
@@ -18,6 +61,31 @@ class Plotter:
         self.s0 = s0
         self.image_fn = image_fn
         self.agg_fn = state_aggregation_fn
+
+        # schema: metric and feature columns of the logged data and the testset
+        conn = connect_ro(data)
+        traj_cols = _table_columns(conn, "trajectories")
+        self.traj_cols = set(traj_cols)
+        self.final_object_metrics = traj_cols[traj_cols.index("total_reward"): traj_cols.index("logprobs_forward")]
+        self.feature_cols = traj_cols[traj_cols.index("features_valid") + 1:]
+        testset_cols = _table_columns(conn, "testset")
+        self.testset_cols = set(testset_cols)
+        if testset_cols:
+            self.testset_metrics = testset_cols[testset_cols.index("total_reward"): testset_cols.index("features_valid")]
+            self.feature_cols_testset = [c for c in testset_cols if c.startswith("f_") and c[2:].isdigit()]
+            self.has_testset = conn.execute("SELECT EXISTS (SELECT 1 FROM testset)").fetchone()[0] == 1
+        else:
+            self.testset_metrics = []
+            self.feature_cols_testset = []
+            self.has_testset = False
+        conn.close()
+
+        # Projection cache shared by all sessions and worker processes.
+        # Keyed by the db state at startup: restart the dashboard to see newly logged data.
+        stat = os.stat(data)
+        fingerprint = f"{Path(data).resolve()}|{stat.st_mtime_ns}|{stat.st_size}"
+        cache_dir = Path(tempfile.gettempdir()) / "gflowstate_cache" / hashlib.sha1(fingerprint.encode()).hexdigest()[:16]
+        self.cache = diskcache.Cache(str(cache_dir), size_limit=2 ** 30)
 
         #colorscales
         self.cs_main = px.colors.sequential.speed
@@ -104,31 +172,26 @@ class Plotter:
 
         return fig
 
-    def hex_hover_figures(self, hex_q, hex_r, metric, ss_style, metric_in_testset, usetestset):
+    def hex_hover_figures(self, dp, hex_q, hex_r, metric, ss_style, metric_in_testset, usetestset):
         """
         Calculate the figures for the tooltips for the hex state space
+        :param dp: projection dataframe from get_projection
         :return:
         """
+        check_choice(ss_style, HEX_STYLES, "state space style")
+        metric_col = quote_ident(metric, self.final_object_metrics)
         lossfig = None
         metricfig = None
 
         # get texts
-        conn = sqlite3.connect(self.data)
-        query = f"""
-                    SELECT text
-                    FROM current_dp
-                    WHERE hex_q = {hex_q} AND hex_r = {hex_r} AND istestset = 0
-                """
-        texts = pd.read_sql_query(query, conn)["text"].tolist()
+        in_hex = dp[(dp["hex_q"] == int(hex_q)) & (dp["hex_r"] == int(hex_r))]
+        texts = in_hex.loc[~in_hex["istestset"], "text"].tolist()
         placeholders = ",".join("?" for _ in texts)
         if usetestset:
-            query = f"""
-                        SELECT text
-                        FROM current_dp
-                        WHERE hex_q = {hex_q} AND hex_r = {hex_r} AND istestset = 1
-                    """
-            texts_t = pd.read_sql_query(query, conn)["text"].tolist()
+            texts_t = in_hex.loc[in_hex["istestset"], "text"].tolist()
             placeholders_t = ",".join("?" for _ in texts_t)
+
+        conn = connect_ro(self.data)
 
         # get loss table
         query = f"""
@@ -155,10 +218,13 @@ class Plotter:
             pd.read_sql_query(query, conn, params=texts).to_numpy().flatten()
         )
         if usetestset:
-            query = f"SELECT total_reward FROM testset WHERE text in ({placeholders_t})"
-            rewards_testset = (
-                pd.read_sql_query(query, conn, params=texts_t).to_numpy().flatten()
-            )
+            if self.has_testset:
+                query = f"SELECT total_reward FROM testset WHERE text in ({placeholders_t})"
+                rewards_testset = (
+                    pd.read_sql_query(query, conn, params=texts_t).to_numpy().flatten()
+                )
+            else:
+                rewards_testset = np.array([])
 
         # if metric custom metric is choosen, give dist as well
         if (
@@ -167,27 +233,29 @@ class Plotter:
                 and metric != "loss"
         ):
             query = f"""
-                        SELECT {metric}
+                        SELECT {metric_col}
                         FROM trajectories
                         WHERE final_object = 1 AND text in ({placeholders})
                     """
             metric_samples = (
                 pd.read_sql_query(query, conn, params=texts).to_numpy().flatten()
             )
-            if metric_in_testset and usetestset:
-                query = f"SELECT {metric} FROM testset WHERE text in ({placeholders_t})"
+            if metric_in_testset and usetestset and self.has_testset:
+                metric_col_t = quote_ident(metric, self.testset_metrics)
+                query = f"SELECT {metric_col_t} FROM testset WHERE text in ({placeholders_t})"
                 metric_testset = (
                     pd.read_sql_query(query, conn, params=texts_t).to_numpy().flatten()
                 )
+            else:
+                metric_testset = np.array([])
 
         # Use metric plot for correlation scatter
         if ss_style == "Hex Correlation":
-            query = f"""
-                        SELECT id, total_reward AS reward, log_pf AS pf
-                        FROM current_dp
-                        WHERE hex_q = {hex_q} AND hex_r = {hex_r} AND istestset = 0
-                    """
-            corr_df = pd.read_sql_query(query, conn)
+            corr_df = (
+                in_hex.loc[~in_hex["istestset"], ["id", "total_reward", "log_pf"]]
+                .rename(columns={"total_reward": "reward", "log_pf": "pf"})
+                .reset_index(drop=True)
+            )
             corr_df["reward"] = np.log(corr_df["reward"])
             # check if correlation is similar
             # print("corr", corr_df["reward"].corr(corr_df["pf"]))
@@ -309,12 +377,14 @@ class Plotter:
         return (lossfig, rewardfig, metricfig), texts
 
 
-    def update_hex(self, df, selected_ids, ss_style, metric, usetestset, size=8.0):
+    def update_hex(self, df, dp, selected_ids, ss_style, metric, usetestset, size=8.0):
         """
         Update the state space plot for hex style
         :param df: df with grouped data for hex (hex_r, hex_q, metric, n_samples, n_test)
+        :param dp: projection dataframe from get_projection
         :return: figure
         """
+        check_choice(metric, self.final_object_metrics, "metric")
         fig = go.Figure()
 
         # colorscales and titles
@@ -367,17 +437,20 @@ class Plotter:
 
         if selected_ids:
             # get texts first as ids in dp table might not be the same (multiple final objects)
-            conn = sqlite3.connect(self.data)
+            conn = connect_ro(self.data)
             placeholders = ",".join("?" for _ in selected_ids)
             query = f"SELECT DISTINCT text FROM trajectories WHERE final_object = 1 AND final_id IN ({placeholders})"
             selected_texts = pd.read_sql_query(query, conn, params=selected_ids)["text"].tolist()
-            if usetestset:
+            if usetestset and self.has_testset:
                 query = f"SELECT DISTINCT text FROM testset WHERE id IN ({placeholders})"
                 selected_texts_t = pd.read_sql_query(query, conn, params=selected_ids)["text"].tolist()
                 selected_texts = selected_texts + selected_texts_t
-            placeholders = ",".join("?" for _ in selected_texts)
-            query = f"SELECT id, text, iteration, {metric} AS metric, x, y, hex_q, hex_r FROM current_dp WHERE text in ({placeholders})"
-            selected_df = pd.read_sql_query(query, conn, params=selected_texts)
+            conn.close()
+            selected_df = (
+                dp.loc[dp["text"].isin(selected_texts), ["id", "text", "iteration", metric, "x", "y", "hex_q", "hex_r"]]
+                .rename(columns={metric: "metric"})
+                .reset_index(drop=True)
+            )
             if ss_style == "Hex Ratio":
                 selected_df["metric"] = np.where(selected_df["id"] >= 0, 1, -1)
             # check if all selected ids are in one hex: in this case zoom in and disable hex hover
@@ -502,23 +575,22 @@ class Plotter:
 
         return fig
 
-    def get_hexbin_data(self, conn, method, metric):
+    def get_hexbin_data(self, dp, method, metric):
         """
         Get the data for the hex plots
+        :param dp: projection dataframe from get_projection
         """
+        check_choice(method, HEX_STYLES, "state space style")
+        check_choice(metric, self.final_object_metrics, "metric")
+        is_test = dp["istestset"].astype(bool)
+        df = (
+            dp.assign(n_test=is_test.astype(int), n_samples=(~is_test).astype(int))
+            .groupby(["hex_r", "hex_q"], as_index=False)[["n_test", "n_samples"]]
+            .sum()
+        )
+        samples = dp[~is_test]
+
         if method == "Hex Ratio":
-            query = f"""
-                SELECT 
-                    hex_r, 
-                    hex_q,
-                    SUM(CASE WHEN istestset = 1 THEN 1 ELSE 0 END) AS n_test,
-                    SUM(CASE WHEN istestset = 0 THEN 1 ELSE 0 END) AS n_samples
-                FROM current_dp
-                GROUP BY
-                    hex_r,
-                    hex_q;
-                """
-            df = pd.read_sql_query(query, conn)
             if df["n_test"].sum() == 0: #no testset used, return frequency
                 df["metric"] = df["n_samples"]
             else:
@@ -529,48 +601,19 @@ class Plotter:
                 df["metric"] = (df["n_samples"]+eps)/(df["n_test"]+eps)
                 df["metric"] = (df["metric"]**2-ratio**2)/(df["metric"]**2+ratio**2)
         elif method == "Hex Obj. Metric":
-            query = f"""
-                SELECT 
-                    hex_r, 
-                    hex_q,
-                    SUM(CASE WHEN istestset = 1 THEN 1 ELSE 0 END) AS n_test,
-                    SUM(CASE WHEN istestset = 0 THEN 1 ELSE 0 END) AS n_samples,
-                    COALESCE(AVG(CASE WHEN istestset = 0 THEN {metric} END), 0) AS metric
-                FROM current_dp
-                GROUP BY
-                    hex_r,
-                    hex_q;
-            """
-            df = pd.read_sql_query(query, conn)
-        elif method == "Hex Correlation":
-            query = f"""
-                SELECT 
-                    hex_r, 
-                    hex_q,
-                    SUM(CASE WHEN istestset = 1 THEN 1 ELSE 0 END) AS n_test,
-                    SUM(CASE WHEN istestset = 0 THEN 1 ELSE 0 END) AS n_samples
-                FROM current_dp
-                GROUP BY
-                    hex_r,
-                    hex_q;
-            """
-            df = pd.read_sql_query(query, conn)
-
-            query = "SELECT hex_r, hex_q, log_pf, total_reward FROM current_dp WHERE istestset=0"
-            df_corr = pd.read_sql_query(query, conn)
+            means = samples.groupby(["hex_r", "hex_q"])[metric].mean().rename("metric").reset_index()
+            df = df.merge(means, on=["hex_r", "hex_q"], how="left")
+            df["metric"] = df["metric"].fillna(0)
+        else:  # Hex Correlation
             df_corr = (
-                df_corr.groupby(["hex_r", "hex_q"])
+                samples.groupby(["hex_r", "hex_q"])[["log_pf", "total_reward"]]
                 .apply(lambda g: g["log_pf"].corr(np.log(g["total_reward"])))
                 .rename("metric")
                 .reset_index()
             )
             df = df.merge(df_corr, on=["hex_r", "hex_q"], how="outer")
             df.loc[df["n_samples"] <= 10, "metric"] = np.nan
-
-        else:
-            raise NotImplementedError("Hexbin Data Method Not Implemented")
         return df
-
 
     @staticmethod
     def calculate_hexbins(df, size=8.0):
@@ -614,25 +657,36 @@ class Plotter:
         # Axial coordinates are (q, r) = (x, z)
         return rx.astype(np.int64), rz.astype(np.int64)
 
-    def create_dp_table (
-            self,
-            feature_cols,
-            iteration,
-            use_testset,
-            feature_cols_testset=None,
-            method = "tsne",
-            param_value=15,
-            metric_lists=([], [])
-    ):
-        conn = sqlite3.connect(self.data)
+    def get_projection(self, iteration, use_testset, method="tsne", param_value=15):
+        """
+        Downprojection of the final objects in the iteration range (and the testset).
+        Results are cached on disk, shared by all sessions and worker processes.
+        :return: (dataframe with one row per projected object, hexbin size)
+        """
+        check_choice(method, PROJECTION_METHODS, "projection method")
+        key = ("dp", int(iteration[0]), int(iteration[1]), bool(use_testset), method, int(param_value))
+        result = self.cache.get(key)
+        if result is None:
+            # one process computes, the others wait and read the cached result
+            with diskcache.Lock(self.cache, repr(("lock",) + key), expire=3600):
+                result = self.cache.get(key)
+                if result is None:
+                    result = self._compute_projection([key[1], key[2]], key[3], method, key[5])
+                    self.cache.set(key, result)
+        return result
+
+    def _compute_projection(self, iteration, use_testset, method, param_value):
+        conn = connect_ro(self.data)
+        feature_sql = ", ".join(quote_ident(c, self.traj_cols) for c in self.feature_cols)
+        metric_sql = ", ".join(quote_ident(c, self.traj_cols) for c in self.final_object_metrics)
 
         # Get logged data (unique texts, latest iteration)
         query = f"""
                     SELECT
                         final_id AS id,
                         text,
-                        {", ".join(feature_cols)},
-                        {", ".join(metric_lists[0])},
+                        {feature_sql},
+                        {metric_sql},
                         iteration,
                         features_valid
                     FROM (
@@ -645,8 +699,8 @@ class Plotter:
                             SELECT
                                 final_id,
                                 text,
-                                {", ".join(feature_cols)},
-                                {", ".join(metric_lists[0])},
+                                {feature_sql},
+                                {metric_sql},
                                 iteration,
                                 final_object,
                                 features_valid
@@ -673,19 +727,19 @@ class Plotter:
                         downprojected due to invalid features.
                         """)
 
-        features = logged[feature_cols].to_numpy()
-        df_dp = logged.drop(columns=feature_cols)
+        features = logged[self.feature_cols].to_numpy()
+        df_dp = logged.drop(columns=self.feature_cols)
 
         # Get testset data
-        testset_hasdata = pd.read_sql_query("SELECT COUNT(*) FROM testset", conn)
-        testset_hasdata = testset_hasdata["COUNT(*)"].tolist()[0]
-        if use_testset and testset_hasdata:
+        if use_testset and self.has_testset:
+            feature_sql_t = ", ".join(quote_ident(c, self.testset_cols) for c in self.feature_cols_testset)
+            metric_sql_t = ", ".join(quote_ident(c, self.testset_cols) for c in self.testset_metrics)
             query = f"""
                         SELECT
                             id,
                             text,
-                            {", ".join(feature_cols_testset)},
-                            {", ".join(metric_lists[1])}
+                            {feature_sql_t},
+                            {metric_sql_t}
                         FROM testset
                         WHERE features_valid = 1
                     """
@@ -699,12 +753,12 @@ class Plotter:
                         """)
 
             # concat features
-            features_t = testset[feature_cols_testset].to_numpy()
-            testset = testset.drop(columns=feature_cols_testset)
+            features_t = testset[self.feature_cols_testset].to_numpy()
+            testset = testset.drop(columns=self.feature_cols_testset)
             assert features.shape[1] == features_t.shape[1], f"""
                             Testset and Logged data have a different amout of features.\n
-                            Testset: {feature_cols_testset}
-                            Logged: {feature_cols}
+                            Testset: {self.feature_cols_testset}
+                            Logged: {self.feature_cols}
                         """
             features = np.concatenate((features, features_t), axis=0)
             df_dp = pd.concat([df_dp, testset], axis=0, ignore_index=True)
@@ -736,31 +790,29 @@ class Plotter:
         hexbin_size = float(max(proj_s.max(axis=0) - proj_s.min(axis=0))) / 16
         df_dp["hex_q"], df_dp["hex_r"] = self.calculate_hexbins(df_dp, size=hexbin_size)
 
-        # write
-        df_dp.to_sql("current_dp", conn, if_exists="replace", index=False)
-
         # add P_F for correlation data
         # For each final object sum over all its trajectories the probabilities to sample them
         # Take the trajectory with the latest iteration if there are doubles
-        query = f"""
+        # The texts of the projected samples go into a TEMP table (private to this connection)
+        conn.execute("CREATE TEMP TABLE dp_texts (text TEXT PRIMARY KEY)")
+        conn.executemany(
+            "INSERT OR IGNORE INTO temp.dp_texts (text) VALUES (?)",
+            ((t,) for t in df_dp.loc[~df_dp["istestset"], "text"]),
+        )
+        query = """
             WITH relevant_finals AS (
                 SELECT DISTINCT
-                    dp.hex_r,
-                    dp.hex_q,
                     tr.final_id,
                     tr.text          AS final_text,
                     tr.total_reward  AS reward
-                FROM current_dp dp
+                FROM temp.dp_texts dp
                 JOIN trajectories tr
                     ON tr.text = dp.text
                    AND tr.final_object = 1
-               WHERE dp.istestset = 0
             ),
             traj_agg AS (
                 SELECT
                     t.final_id,
-                    rf.hex_r,
-                    rf.hex_q,
                     rf.final_text                              AS text,
                     rf.reward                                  AS reward,
                     MAX(t.iteration)                           AS iteration,
@@ -768,13 +820,13 @@ class Plotter:
                     GROUP_CONCAT(t.text, '||')  AS sequence
                 FROM trajectories t
                 JOIN relevant_finals rf ON rf.final_id = t.final_id
-                GROUP BY t.final_id, rf.hex_r, rf.hex_q
+                GROUP BY t.final_id
             ),
             deduped AS (
                 SELECT
                     *,
                     ROW_NUMBER() OVER (
-                        PARTITION BY hex_r, hex_q, text, sequence
+                        PARTITION BY text, sequence
                         ORDER BY iteration DESC
                     ) AS rn
                 FROM traj_agg
@@ -782,41 +834,20 @@ class Plotter:
             with_max AS (
                 SELECT
                     *,
-                    MAX(traj_logprob_forward)  OVER (PARTITION BY hex_r, hex_q, text) AS max_fwd
+                    MAX(traj_logprob_forward)  OVER (PARTITION BY text) AS max_fwd
                 FROM deduped
                 WHERE rn = 1
             )
             SELECT
-                hex_r,
-                hex_q,
                 text,
-                MAX(max_fwd) + LN(SUM(EXP(traj_logprob_forward - max_fwd)))  AS log_pf,
-                MAX(reward) AS reward
+                MAX(max_fwd) + LN(SUM(EXP(traj_logprob_forward - max_fwd)))  AS log_pf
             FROM with_max
-            GROUP BY hex_r, hex_q, text
-            ORDER BY hex_r, hex_q, text;
+            GROUP BY text
             """
-        df = pd.read_sql_query(query, conn)
-
-        conn.execute("ALTER TABLE current_dp ADD COLUMN log_pf REAL")
-        df[["text", "log_pf"]].to_sql(
-            "temp_updates",
-            conn,
-            if_exists="replace",
-            index=False
-        )
-        conn.execute("""
-         UPDATE current_dp
-         SET log_pf = (SELECT temp_updates.log_pf
-                          FROM temp_updates
-                          WHERE temp_updates.text = current_dp.text)
-         WHERE EXISTS (SELECT 1
-                       FROM temp_updates
-                       WHERE temp_updates.text = current_dp.text)
-         """)
-        conn.commit()
-
+        log_pf = pd.read_sql_query(query, conn)
         conn.close()
+
+        df_dp = df_dp.merge(log_pf, on="text", how="left")
 
         return df_dp, hexbin_size
 
@@ -840,9 +871,10 @@ class Plotter:
         :return: dict with elements and stylesheets
         """
 
-        conn = sqlite3.connect(self.data)
+        check_choice(metric, DAG_METRICS, "DAG metric")
+        column = "logprobs_" + check_choice(direction, DIRECTIONS, "direction")
+        conn = connect_ro(self.data)
         placeholders = ",".join("?" for _ in build_ids)
-        column = "logprobs_" + direction
         base_where = f"""
             source IN ({placeholders})
             AND target IN ({placeholders})
@@ -1184,7 +1216,7 @@ class Plotter:
         removes the node from the list and all unconnected children
         :return: new list
         """
-        conn = sqlite3.connect(self.data)
+        conn = connect_ro(self.data)
         remaining = set(nodelist)
         if node_to_remove not in remaining:
             return remaining
@@ -1214,11 +1246,13 @@ class Plotter:
         This is the fast implementation and might break for scrolling far down.
         might need to implement with keyset later on.
         """
-        column = "logprobs_" + direction
+        check_choice(metric, DAG_METRICS, "DAG metric")
+        column = "logprobs_" + check_choice(direction, DIRECTIONS, "direction")
         top_n = 150
+        page = max(int(page), 0)
         offset = top_n * page
 
-        conn = sqlite3.connect(self.data)
+        conn = connect_ro(self.data)
 
         # Build query based on metric
         if metric == "highest":
@@ -1460,6 +1494,7 @@ class Plotter:
         :param metric: metric for coloring
         :return: updated plot
         """
+        check_choice(metric, self.final_object_metrics, "metric")
         # Normalize metric, scale to range 6-30px, set size=4 for missing values (no metric in testset)
         m_min = df[metric].min()
         m_max = df[metric].max()
@@ -1788,7 +1823,7 @@ class Plotter:
         :param iterations: iteration range
         :return: list of ids
         """
-        conn = sqlite3.connect(self.data)
+        conn = connect_ro(self.data)
         placeholders = ",".join("?" for _ in selected_ids)
         query = f"""
         
