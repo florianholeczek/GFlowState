@@ -212,8 +212,8 @@ class Plotter:
             xaxis_title=name,
             yaxis_title="Probability Density",
             template=self.plotly_template,
-            height=200,
-            width=450,
+            height=160,
+            width=360,
             margin=dict(l=20, r=20, t=30, b=20),
             barmode="overlay",
             showlegend=True,
@@ -355,8 +355,8 @@ class Plotter:
                 xaxis_title="Iteration",
                 yaxis_title="Loss",
                 template=self.plotly_template,
-                height=200,
-                width=450,
+                height=160,
+                width=360,
                 margin=dict(l=20, r=20, t=30, b=20),
                 xaxis=dict(nticks=4),
             )
@@ -413,14 +413,21 @@ class Plotter:
             metricfig.update_layout(
                 title="(Log) Reward vs Forward (Log) Probabilities for Samples",
                 template=self.plotly_template,
-                height=200,
-                width=550,
+                height=170,
+                width=460,
                 margin=dict(l=20, r=20, t=30, b=20),
             )
             metricfig.update_xaxes(row=1, col=1, title_text=" Log Reward")
             metricfig.update_yaxes(row=1, col=1, title_text="Logprobabilities")
             metricfig.update_xaxes(row=1, col=2, title_text="Reward")  # , range=[,])
             metricfig.update_yaxes(row=1, col=2, title_text="Probabilities")
+
+        # smaller titles and ticks for the compact tooltip
+        for f in (lossfig, rewardfig, metricfig):
+            if f is not None:
+                f.update_layout(title_font_size=13)
+                f.update_xaxes(title_font_size=11, tickfont_size=10)
+                f.update_yaxes(title_font_size=11, tickfont_size=10)
 
         if usetestset:
             texts += texts_t

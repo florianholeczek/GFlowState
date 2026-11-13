@@ -96,6 +96,11 @@ body {
     max-height: 120px; overflow: auto; overflow-wrap: anywhere;
 }
 .gfs-dag-table td[data-dash-column="image"] p { margin: 0; }
+/* DataTable styles its own `.dash-tooltip` with a border, which dcc.Tooltip's zero-height
+   anchor box shares: without this a line shows on the hovered point */
+.dcc-tooltip-bounding-box.dash-tooltip { border: none; }
+/* the state space tooltip is placed freely next to the hex, so its caret would point elsewhere */
+.hover:has(> #image-tooltip1)::before, .hover:has(> #image-tooltip1)::after { display: none; }
 .gfs-dag-table td[data-dash-column="image"] img { max-width: 100%; max-height: 80px; height: auto; display: block; }
 </style>
 </head>
@@ -1011,10 +1016,62 @@ def run_dashboard(
             return fig, max_freq, edge_list
         return fig, no_update, edge_list
 
+    # Position of the state space tooltip, computed in the browser where window and
+    # tooltip sizes are known: it opens to the side of the hex with more room and is
+    # shifted so it stays inside the window. The content size is only known once the
+    # server callback's content has rendered, so a ResizeObserver re-places it then.
+    app.clientside_callback(
+        """
+        function(hoverData) {
+            const nu = window.dash_clientside.no_update;
+            const b = hoverData && hoverData.points.length && hoverData.points[0].bbox;
+            const el = document.getElementById("image-tooltip1");
+            if (!b || !el) { return [nu, nu]; }
+            const cx = (b.x0 + b.x1) / 2;
+            const cy = (b.y0 + b.y1) / 2;
+            const graph = document.getElementById("state-space-plot").getBoundingClientRect();
+            const direction = window.innerWidth - cx >= cx - graph.left ? "right" : "left";
+            window.gfsTooltip = {cx: cx, cy: cy, direction: direction, hh: (b.y1 - b.y0) / 2};
+
+            const place = () => {
+                const s = window.gfsTooltip;
+                const W = window.innerWidth, H = window.innerHeight;
+                const w = el.offsetWidth, h = el.offsetHeight, pad = 8, gap = 10;
+                if (!s || !w) { return; }
+                const clamp = (v, size, max) => Math.max(pad, Math.min(v, max - size - pad));
+                let x, y;
+                const side = s.direction === "right" ? W - s.cx : s.cx;
+                if (side >= w + gap + pad) {
+                    // beside the hex, vertically centered
+                    x = s.direction === "right" ? s.cx + gap : s.cx - gap - w;
+                    y = clamp(s.cy - h / 2, h, H);
+                } else {
+                    // too wide for either side: above or below the hex, whichever has more room
+                    x = clamp(s.cx - w / 2, w, W);
+                    y = H - s.cy >= s.cy ? s.cy + s.hh + gap : s.cy - s.hh - gap - h;
+                    y = clamp(y, h, H);
+                }
+                el.style.transform = "none";
+                const natural = el.getBoundingClientRect();
+                el.style.transform = `translate(${x - natural.left}px, ${y - natural.top}px)`;
+            };
+            if (!window.gfsTooltipObserver) {
+                window.gfsTooltipObserver = new ResizeObserver(place);
+                window.gfsTooltipObserver.observe(el);
+            }
+            // after Dash has applied bbox and direction
+            setTimeout(() => requestAnimationFrame(place), 0);
+            return [b, direction];
+        }
+        """,
+        Output("image-tooltip1", "bbox"),
+        Output("image-tooltip1", "direction"),
+        Input("state-space-plot", "hoverData"),
+    )
+
     #hover state space
     @app.callback(
         Output("image-tooltip1", "show"),
-        Output("image-tooltip1", "bbox"),
         Output("image-tooltip1", "children"),
         Input("state-space-plot", "hoverData"),
         State("fo-metric", "value"),
@@ -1026,11 +1083,10 @@ def run_dashboard(
     )
     def display_image_tooltip1(hoverData, metric, ss_style, usetestset, iteration, method, param_value):
         if hoverData is None:
-            return False, None, None
-        bbox = hoverData["points"][0]["bbox"]
+            return False, None
         customdata = hoverData["points"][0]["customdata"]
         if customdata is None:
-            return False, None, None
+            return False, None
 
         if customdata[0] == "usehex":
             _, hex_q, hex_r, metric_value, n_samples, n_test = customdata
@@ -1058,11 +1114,12 @@ def run_dashboard(
                 metric,
                 ss_style,
             )
+            # explicit size so the tooltip has its final height on first render (used for positioning)
             fig_graphs = [
                 dcc.Graph(
                     figure=fig,
                     config={"displayModeBar": False},
-                    style={"marginTop": "20px"}
+                    style={"height": f"{fig.layout.height}px", "width": f"{fig.layout.width}px"}
                 )
                 for fig in figures
                 if fig is not None
@@ -1072,24 +1129,29 @@ def run_dashboard(
             elif isinstance(aggregation, str):
                 aggregation = html.Img(src=aggregation, style={"width": "150px", "height": "150px"})
 
-            children = [
+            info = html.Div([
+                html.Div(
+                    aggregation,
+                    style={"marginRight": "15px"}
+                ),
                 html.Div([
-                    *fig_graphs,
-                    html.Div([
-                        html.Div(
-                            aggregation,
-                            style={"marginRight": "15px"}
-                        ),
-                        html.Div([
-                            html.Div(f" Unique Samples: {n_samples}", style={"color": "black", "marginTop": "5px"}),
-                            html.Div(f" Testset Objects: {n_test}", style={"color": "black", "marginTop": "5px"}),
-                            html.Div(metric_title, style={"color": "black", "marginTop": "5px"}),
-                        ]),
-                    ], style={
-                        "display": "flex",
-                        "alignItems": "center"  # vertical alignment
-                    })
-                ])
+                    html.Div(f" Unique Samples: {n_samples}", style={"color": "black", "marginTop": "5px"}),
+                    html.Div(f" Testset Objects: {n_test}", style={"color": "black", "marginTop": "5px"}),
+                    html.Div(metric_title, style={"color": "black", "marginTop": "5px"}),
+                ]),
+            ], style={
+                "display": "flex",
+                "alignItems": "center"  # vertical alignment
+            })
+
+            # 2-column grid keeps the tooltip short enough to fit next to the hovered hex
+            children = [
+                html.Div([*fig_graphs, info], style={
+                    "display": "grid",
+                    "gridTemplateColumns": "repeat(2, auto)",
+                    "gap": "8px 12px",
+                    "alignItems": "center",
+                })
             ]
 
         else:
@@ -1110,7 +1172,7 @@ def run_dashboard(
                 ])
             ]
 
-        return True, bbox, children
+        return True, children
 
 
     #hover bump plot
