@@ -766,33 +766,20 @@ class Plotter:
         # Downprojection
         if features.shape[1] <= 1:
             raise ValueError("Not enough features")
-        elif features.shape[1] == 2:
-            proj_s = features
-        elif method == "tsne":
-            proj_s = manifold.TSNE(
-                perplexity=min(param_value, features.shape[0] - 1),
-                init="pca",
-                learning_rate="auto",
-            ).fit_transform(features)
-
-        elif method == "umap":
-            reducer_s = UMAP(n_neighbors=min(param_value, features.shape[0] - 1))
-            proj_s = reducer_s.fit_transform(features)
-
-        else:
-            raise NotImplementedError("Method not implemented")
+        proj_s = self._project(features, method, param_value)
 
         df_dp["x"] = proj_s[:, 0]
         df_dp["y"] = proj_s[:, 1]
         df_dp["istestset"] = df_dp["id"] < 0
 
-        # calc hexbins
-        hexbin_size = float(max(proj_s.max(axis=0) - proj_s.min(axis=0))) / 16
+        # calc hexbins (fallback size if there are no points or all of them coincide)
+        extent = float(np.max(proj_s.max(axis=0) - proj_s.min(axis=0))) if len(proj_s) else 0.0
+        hexbin_size = extent / 16 if extent > 0 else 1.0
         df_dp["hex_q"], df_dp["hex_r"] = self.calculate_hexbins(df_dp, size=hexbin_size)
 
         # add P_F for correlation data
-        # For each final object sum over all its trajectories the probabilities to sample them
-        # Take the trajectory with the latest iteration if there are doubles
+        # Load all states (in step order) of the trajectories in the iteration range that end
+        # in one of the projected samples.
         # The texts of the projected samples go into a TEMP table (private to this connection)
         conn.execute("CREATE TEMP TABLE dp_texts (text TEXT PRIMARY KEY)")
         conn.executemany(
@@ -800,56 +787,93 @@ class Plotter:
             ((t,) for t in df_dp.loc[~df_dp["istestset"], "text"]),
         )
         query = """
-            WITH relevant_finals AS (
-                SELECT DISTINCT
-                    tr.final_id,
-                    tr.text          AS final_text,
-                    tr.total_reward  AS reward
+            SELECT
+                t.final_id,
+                t.text,
+                t.iteration,
+                t.logprobs_forward,
+                rf.final_text
+            FROM trajectories t
+            JOIN (
+                SELECT tr.final_id, tr.text AS final_text
                 FROM temp.dp_texts dp
                 JOIN trajectories tr
                     ON tr.text = dp.text
                    AND tr.final_object = 1
-            ),
-            traj_agg AS (
-                SELECT
-                    t.final_id,
-                    rf.final_text                              AS text,
-                    rf.reward                                  AS reward,
-                    MAX(t.iteration)                           AS iteration,
-                    SUM(t.logprobs_forward)                    AS traj_logprob_forward,
-                    GROUP_CONCAT(t.text, '||')  AS sequence
-                FROM trajectories t
-                JOIN relevant_finals rf ON rf.final_id = t.final_id
-                GROUP BY t.final_id
-            ),
-            deduped AS (
-                SELECT
-                    *,
-                    ROW_NUMBER() OVER (
-                        PARTITION BY text, sequence
-                        ORDER BY iteration DESC
-                    ) AS rn
-                FROM traj_agg
-            ),
-            with_max AS (
-                SELECT
-                    *,
-                    MAX(traj_logprob_forward)  OVER (PARTITION BY text) AS max_fwd
-                FROM deduped
-                WHERE rn = 1
-            )
-            SELECT
-                text,
-                MAX(max_fwd) + LN(SUM(EXP(traj_logprob_forward - max_fwd)))  AS log_pf
-            FROM with_max
-            GROUP BY text
+                   AND tr.iteration BETWEEN ? AND ?
+            ) rf ON rf.final_id = t.final_id
+            ORDER BY t.final_id, t.step
             """
-        log_pf = pd.read_sql_query(query, conn)
+        steps = pd.read_sql_query(query, conn, params=iteration)
         conn.close()
 
-        df_dp = df_dp.merge(log_pf, on="text", how="left")
+        df_dp = df_dp.merge(self._log_pf(steps), on="text", how="left")
 
         return df_dp, hexbin_size
+
+    # Below this many samples t-SNE / UMAP are not defined or not meaningful
+    MIN_SAMPLES_DR = 5
+
+    @staticmethod
+    def _project(features, method, param_value):
+        """
+        Project the features to 2D.
+        :param features: np array (n_samples, n_features)
+        :param method: tsne or umap
+        :param param_value: perplexity (tsne) or n_neighbors (umap)
+        :return: np array (n_samples, 2)
+        """
+        n = features.shape[0]
+        if features.shape[1] == 2:
+            return features
+        if n < Plotter.MIN_SAMPLES_DR:
+            # too few samples: first two principal components (zero padded)
+            proj = np.zeros((n, 2))
+            if n > 1:
+                centered = features - features.mean(axis=0)
+                u, s, _ = np.linalg.svd(centered, full_matrices=False)
+                k = min(2, len(s))
+                proj[:, :k] = u[:, :k] * s[:k]
+            return proj
+        if method == "tsne":
+            return manifold.TSNE(
+                perplexity=min(param_value, n - 1),
+                init="pca",
+                learning_rate="auto",
+            ).fit_transform(features)
+        if method == "umap":
+            return UMAP(n_neighbors=min(param_value, n - 1)).fit_transform(features)
+        raise NotImplementedError("Method not implemented")
+
+    @staticmethod
+    def _log_pf(steps):
+        """
+        Log probability to sample each final object under the forward policy:
+        logsumexp over its distinct trajectories of the summed forward logprobs.
+        If the same trajectory (same sequence of states) occurs in several iterations,
+        only the latest one is used.
+        :param steps: df with final_id, text, iteration, logprobs_forward, final_text,
+            ordered by final_id and step
+        :return: df with text and log_pf
+        """
+        if steps.empty:
+            return pd.DataFrame({"text": pd.Series(dtype=object), "log_pf": pd.Series(dtype=float)})
+        by_traj = steps.groupby("final_id", sort=False)
+        traj = by_traj.agg(
+            text=("final_text", "first"),
+            iteration=("iteration", "max"),
+            sequence=("text", lambda s: "||".join(map(str, s))),
+        )
+        traj["logpf"] = by_traj["logprobs_forward"].sum(min_count=1)
+        traj = (
+            traj.sort_values("iteration", ascending=False, kind="stable")
+            .drop_duplicates(["text", "sequence"])
+        )
+        by_text = traj["logpf"].groupby(traj["text"])
+        max_lp = by_text.transform("max")
+        sum_exp = np.exp(traj["logpf"] - max_lp).groupby(traj["text"]).sum(min_count=1)
+        log_pf = by_text.max() + np.log(sum_exp)
+        return log_pf.rename("log_pf").reset_index()
 
     def update_DAG(
             self,
@@ -1498,7 +1522,11 @@ class Plotter:
         # Normalize metric, scale to range 6-30px, set size=4 for missing values (no metric in testset)
         m_min = df[metric].min()
         m_max = df[metric].max()
-        df["metric_norm"] = 6 + (df[metric] - m_min) / (m_max - m_min) * (30 - 6)
+        if m_max > m_min:
+            df["metric_norm"] = 6 + (df[metric] - m_min) / (m_max - m_min) * (30 - 6)
+        else:
+            # all values equal (or missing): medium size
+            df["metric_norm"] = np.where(df[metric].notna(), 18.0, np.nan)
         df["metric_norm"] = df["metric_norm"].fillna(4)
 
         if selected_ids:

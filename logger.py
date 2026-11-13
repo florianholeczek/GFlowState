@@ -126,7 +126,18 @@ class VisLogger:
         self.df = pd.DataFrame(columns=self.cols)
 
         # tracks the logged data
-        self. current = {
+        self._reset_current()
+
+        # Checks and Warnings
+        assert self.fn_state_to_text is not None, "No fn_state_to_text provided. This is neccessary to distinguish states."
+
+    def _reset_current(self):
+        """
+        Resets the logged data of the current block.
+        Every key must be logged again before the next write_to_db().
+        :return: None
+        """
+        self.current = {
             "batch_idx": None,
             "states": None,
             "total_reward": None,
@@ -135,13 +146,10 @@ class VisLogger:
             "logprobs_forward": None,
             "logprobs_backward": None,
         }
-        self.current.update({name: None for name in metrics or []})
-        self.current.update({name: None for name in features or []})
+        self.current.update({name: None for name in self.metrics or []})
+        self.current.update({name: None for name in self.features or []})
         if self.features:
-            self.current.update({"features_valid_provided": None})
-
-        # Checks and Warnings
-        assert self.fn_state_to_text is not None, "No fn_state_to_text provided. This is neccessary to distinguish states."
+            self.current["features_valid_provided"] = None
 
     def attach_fns(self, fn_state_to_text=None, fn_compute_features=None):
         """
@@ -202,13 +210,13 @@ class VisLogger:
         :param features_valid_provided: boolean array of shape(sum(trajectory_lengths), ).
             Flags if the provided features are valid. Otherwise they are ignored.
         :param features: Optional. Additionally logged features based on the initialized features.
-            A torch Tensor or np array of shape (len(features), sum(trajectory_lengths)) or
+            A torch Tensor or np array of shape (sum(trajectory_lengths), len(features)) or
             a nested list of the same shape.
         :return: None
         """
 
         if batch_idx is not None:
-            self.current["batch_idx"] = self.__to_np__(batch_idx, np.int16)
+            self.current["batch_idx"] = self.__to_np__(batch_idx, np.int64)
         if states is not None:
             if isinstance(states, list):
                 self.current["states"] = states
@@ -232,6 +240,9 @@ class VisLogger:
         if features_valid_provided is not None:
             self.current["features_valid_provided"] = self.__to_np__(features_valid_provided, np.bool_)
         if features is not None:
+            if isinstance(features, torch.Tensor):
+                features = features.detach().cpu().numpy()
+            features = np.asarray(features)
             for i,r in enumerate(self.features):
                 self.current[r] = features[:, i]
 
@@ -257,6 +268,20 @@ class VisLogger:
         if isinstance(x, torch.Tensor):
             x = x.detach().cpu().numpy()
         return x.astype(dtype, copy=False)
+
+    def __select_states__(self, idx):
+        """
+        Selects states by row index, keeping the format they were logged in
+        (list, np array or torch Tensor).
+        :param idx: np array of row indices
+        :return: selected states
+        """
+        states = self.current["states"]
+        if isinstance(states, list):
+            return [states[i] for i in idx]
+        if isinstance(states, torch.Tensor):
+            return states[torch.as_tensor(idx, dtype=torch.long)]
+        return states[idx]
 
 
     def write_to_db(self, compute_graph=True):
@@ -316,8 +341,9 @@ class VisLogger:
         # compute texts
         data["text"] = self.fn_state_to_text(self.current["states"])
 
-        # add states temporarily to allow feature computation only for neccessary ones
-        data["states"] = self.current["states"]
+        # keep the row index of each state to allow feature computation only for neccessary ones
+        # (states themselves may be multi-dimensional and can not be stored in a column)
+        data["state_idx"] = np.arange(datalength)
 
         # delete s0 or update step to start with 1
         if self.s0_included:
@@ -341,7 +367,9 @@ class VisLogger:
         #compute features
         feature_cols = None
         if self.fn_compute_features is not None:
-            features, features_valid = self.fn_compute_features(list(data["states"]))
+            features, features_valid = self.fn_compute_features(
+                self.__select_states__(data["state_idx"].to_numpy())
+            )
             data["features_valid_computed"] = features_valid
             feature_cols = [f"computed_features_{i}" for i in range(features.shape[1])]
             features_df = pd.DataFrame(features, columns=feature_cols, index=data.index)
@@ -401,16 +429,7 @@ class VisLogger:
         conn.close()
 
         # reset current
-        self.current = {
-            "batch_idx": None,
-            "states": None,
-            "total_reward": None,
-            "iteration": None,
-            "logprobs_forward": None,
-            "logprobs_backward": None,
-        }
-        self.current.update({name: None for name in self.metrics or []})
-        self.current.update({name: None for name in self.features or []})
+        self._reset_current()
 
     def compute_graph(self):
         conn = sqlite3.connect(self.db)
