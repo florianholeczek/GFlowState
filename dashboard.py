@@ -8,6 +8,108 @@ import dash_cytoscape as cyto
 from plot_utils import *
 from pathlib import Path
 
+# Page shell with the dashboard's stylesheet. The accent is Dash 4's own
+# interactive color (--Dash-Fill-Interactive-Strong) so buttons match the dcc components.
+INDEX_STRING = """<!DOCTYPE html>
+<html>
+<head>
+{%metas%}
+<title>{%title%}</title>
+{%favicon%}
+{%css%}
+<style>
+:root {
+    --gfs-accent: var(--Dash-Fill-Interactive-Strong, #7f4bc4);
+    --gfs-accent-weak: rgba(127, 75, 196, 0.10);
+    --gfs-text: rgba(0, 18, 77, 0.87);
+    --gfs-text-weak: rgba(0, 12, 51, 0.65);
+    --gfs-border: rgba(0, 24, 102, 0.12);
+    --gfs-bg: #f7f7fa;
+    accent-color: var(--gfs-accent);
+}
+html, body { margin: 0; height: 100%; }
+body {
+    font-family: "Open Sans", verdana, arial, sans-serif;
+    font-size: 13px;
+    color: var(--gfs-text);
+    background: #fff;
+}
+.gfs-hidden { display: none !important; }
+.gfs-app { display: flex; width: 100vw; height: 100vh; overflow: hidden; }
+
+/* ---------- sidebar ---------- */
+.gfs-sidebar {
+    flex: 0 0 200px; height: 100vh; overflow-y: auto; box-sizing: border-box;
+    padding: 14px 12px 20px; background: var(--gfs-bg); border-right: 1px solid var(--gfs-border);
+    display: flex; flex-direction: column; gap: 20px;
+}
+.gfs-brand { display: flex; align-items: baseline; justify-content: space-between; }
+.gfs-brand-title { font-size: 15px; font-weight: 700; }
+.gfs-help { font-size: 12px; font-weight: 600; color: var(--gfs-accent); text-decoration: none; }
+.gfs-help:hover { text-decoration: underline; }
+.gfs-section { display: flex; flex-direction: column; gap: 10px; }
+.gfs-section-title {
+    margin: 0; font-size: 11px; font-weight: 700; letter-spacing: 0.06em;
+    text-transform: uppercase; color: var(--gfs-text-weak);
+}
+.gfs-control { display: flex; flex-direction: column; gap: 4px; }
+.gfs-label { font-size: 12px; font-weight: 600; }
+
+/* ---------- buttons ---------- */
+.gfs-btn {
+    font: inherit; font-size: 12px; font-weight: 600; padding: 7px 10px; cursor: pointer;
+    color: var(--gfs-text); background: #fff; border: 1px solid var(--gfs-border); border-radius: 6px;
+    transition: background-color 0.15s, border-color 0.15s, color 0.15s;
+}
+.gfs-btn:hover { border-color: var(--gfs-accent); color: var(--gfs-accent); }
+.gfs-btn.active { background: var(--gfs-accent); border-color: var(--gfs-accent); color: #fff; }
+.gfs-segmented {
+    display: flex; gap: 3px; padding: 3px; background: #fff;
+    border: 1px solid var(--gfs-border); border-radius: 8px;
+}
+.gfs-segmented .gfs-btn { flex: 1; padding: 7px 4px; white-space: nowrap; border-color: transparent; }
+.gfs-segmented .gfs-btn.active { border-color: var(--gfs-accent); }
+.gfs-btn-row { display: flex; gap: 6px; }
+.gfs-btn-row .gfs-btn { flex: 1; white-space: nowrap; }
+
+/* ---------- content ---------- */
+.gfs-main { flex: 1 1 auto; min-width: 0; height: 100vh; overflow: hidden; }
+.gfs-tab { height: 100%; box-sizing: border-box; display: flex; }
+.gfs-fill { flex: 1 1 auto; min-height: 0; }
+.gfs-tab-ss { flex-direction: column; padding: 5px; }
+.gfs-bump { flex: 35 1 0; min-height: 0; }
+.gfs-statespace { flex: 65 1 0; min-height: 0; }
+
+/* DAG tab: the three columns shrink down to their min-width, below that the tab scrolls */
+.gfs-tab-dag { flex-direction: row; gap: 12px; padding: 10px 12px; overflow-x: auto; }
+.gfs-dag-overview { flex: 0 1 380px; min-width: 240px; display: flex; flex-direction: column; gap: 8px; }
+.gfs-dag-main { flex: 1 1 360px; min-width: 320px; display: flex; flex-direction: column; }
+.gfs-dag-title { font-size: 13px; font-weight: 700; }
+.gfs-dag-subtitle { font-size: 11px; color: var(--gfs-text-weak); white-space: pre-line; margin: 2px 0 8px; }
+.gfs-dag-canvas { border: 1px solid var(--gfs-border); border-radius: 8px; overflow: hidden; }
+.gfs-dag-table { flex: 0 1 460px; min-width: 360px; min-height: 0; display: flex; flex-direction: column; }
+.gfs-dag-table > div, .gfs-dag-table .dash-table-container {
+    display: flex; flex-direction: column; flex: 1 1 auto; min-height: 0;
+}
+/* long state texts / large images stay inside their cell */
+.gfs-dag-table td[data-dash-column="image"] .dash-cell-value {
+    max-height: 120px; overflow: auto; overflow-wrap: anywhere;
+}
+.gfs-dag-table td[data-dash-column="image"] p { margin: 0; }
+.gfs-dag-table td[data-dash-column="image"] img { max-width: 100%; max-height: 80px; height: auto; display: block; }
+</style>
+</head>
+<body>
+{%app_entry%}
+<footer>
+{%config%}
+{%scripts%}
+{%renderer%}
+</footer>
+</body>
+</html>
+"""
+
 def run_dashboard(
         data: str,
         text_to_img_fn: callable,
@@ -115,9 +217,26 @@ def run_dashboard(
     conn.close()
 
     app = dash.Dash(__name__)
+    app.title = "GFlowState"
+    app.index_string = INDEX_STRING
 
     # Load extra layouts for cytoscape
     cyto.load_extra_layouts()
+
+    def control(label, component, label_id=None):
+        """Sidebar control: small label above the input."""
+        return html.Div([
+            html.Label(label, id=label_id, className="gfs-label") if label_id
+            else html.Label(label, className="gfs-label"),
+            component,
+        ], className="gfs-control")
+
+    def section(title, children, title_id=None, section_id=None, class_name="gfs-section"):
+        header = html.H4(title, id=title_id, className="gfs-section-title") if title_id \
+            else html.H4(title, className="gfs-section-title")
+        if section_id:
+            return html.Div([header, *children], id=section_id, className=class_name)
+        return html.Div([header, *children], className=class_name)
 
     app.layout = html.Div([
         dcc.Store(id="selected-objects", data=[]),
@@ -126,449 +245,185 @@ def run_dashboard(
         dcc.Store(id="dag-overview-edge-list", data= []),
         dcc.Store(id="dag-overview-page", data=0),
         dcc.Store(id="dag-fit-dummy"),
+        dcc.Store(id="active-tab", data="state-space"),
 
-        # ================= LEFT SIDEBAR (12%) =================
+        # ================= LEFT SIDEBAR =================
         html.Div([
-
-    # -------- TAB SELECTOR --------
-            html.A(
-                html.Button("How to Use", style={"border-radius": "8px",}),
-                href="https://github.com/florianholeczek/GFlowNet_Training_Vis_Pilot/blob/master/Dashboard_Introduction.md",
-                target="_blank",
-                style = {
-                    "display": "flex",
-                    "flexDirection": "column",
-                    "margin-bottom": "50px",
-                    "textDecoration": "none"
-                }
-            ),
-
-            html.H4("View"),
             html.Div([
-                html.Button(
-                    "Final Objects",
-                    id="tab-state-space",
-                    n_clicks=0,
+                html.Span("GFlowState", className="gfs-brand-title"),
+                html.A(
+                    "How to Use ↗",
+                    href="https://github.com/florianholeczek/GFlowNet_Training_Vis_Pilot/blob/master/Dashboard_Introduction.md",
+                    target="_blank",
+                    className="gfs-help",
                 ),
-                html.Button(
-                    "DAG",
-                    id="tab-dag-view",
-                    n_clicks=0,
-                )
-            ], style={
-                "display": "flex",
-                "flexDirection": "column",
-                #"gap": "12px"
-            }),
-            dcc.Store(id="active-tab", data="state-space"),
+            ], className="gfs-brand"),
 
-            html.Div(style={
-                "display": "flex",
-                "flexDirection": "column",
-                "gap": "50px",
-                "height": "40px"
-            }),
-
-            html.H4("General"),
-
-            html.Div([
-                html.Button("Clear selection", id="clear-selection", n_clicks=0, style={
-                    "display": "flex",
-                    "flexDirection": "column",
-                    "gap": "6px",
-                    "border-radius": "8px",
-                    "border": "2px solid #e5e7eb",
-                }),
-
-                # -------- Iterations --------
+            # -------- View toggle --------
+            section("View", [
                 html.Div([
-                    html.Div("Iterations", style={"textAlign": "center"}),
-                    dcc.RangeSlider(
-                        id="iteration",
-                        min=iteration_range["min"][0],
-                        max=iteration_range["max"][0],
-                        step=1,
-                        value=[iteration_range["min"][0], iteration_range["max"][0]],
-                        marks=iteration_marks_dict,
-                        tooltip={"placement": "bottom", "always_visible": False}
-                    ),
-                ], style={
-                    "display": "flex",
-                    "flexDirection": "column",
-                    "gap": "6px"
-                }),
+                    html.Button("Final Objects", id="tab-state-space", n_clicks=0, className="gfs-btn active"),
+                    html.Button("DAG", id="tab-dag-view", n_clicks=0, className="gfs-btn"),
+                ], className="gfs-segmented"),
+            ]),
 
-            ], style={
-                "display": "flex",
-                "flexDirection": "column",
-                "gap": "50px"
-            }),
+            # -------- General --------
+            section("General", [
+                control("Iterations", dcc.RangeSlider(
+                    id="iteration",
+                    min=iteration_range["min"][0],
+                    max=iteration_range["max"][0],
+                    step=1,
+                    value=[iteration_range["min"][0], iteration_range["max"][0]],
+                    marks=iteration_marks_dict,
+                    allow_direct_input=False,
+                    tooltip={"placement": "bottom", "always_visible": False}
+                )),
+                html.Button("Clear selection", id="clear-selection", n_clicks=0, className="gfs-btn"),
+            ]),
 
-            html.Div(style={
-                "display": "flex",
-                "flexDirection": "column",
-                "gap": "50px",
-                "height": "40px"
-            }),
+            # -------- Projection controls --------
+            section("Final Objects", [
+                control("Object Metric", dcc.Dropdown(
+                    id="fo-metric",
+                    options=final_object_metrics,
+                    value="total_reward",
+                    clearable=False,
+                )),
+                control("Ranking Metric", dcc.Dropdown(
+                    id="ranking-metric",
+                    options=["highest over all", "highest per iter", "lowest over all", "lowest per iter"],
+                    value="highest over all",
+                    clearable=False,
+                )),
+                control("State Space Style", dcc.Dropdown(
+                    id="state-space-style",
+                    options=["Hex Ratio", "Hex Obj. Metric", "Hex Correlation", "Scatter"],
+                    value="Hex Ratio",
+                    clearable=False,
+                )),
+                control("Dimensionality Reduction", dcc.Dropdown(
+                    id="projection-method",
+                    options=[
+                        {"label": "UMAP", "value": "umap"},
+                        {"label": "t-SNE", "value": "tsne"}
+                    ],
+                    value="tsne",
+                    clearable=False,
+                )),
+                control("", dcc.Slider(
+                    id="projection-param",
+                    min=5,
+                    max=50,
+                    step=1,
+                    value=15,
+                    marks=None,
+                    allow_direct_input=False,
+                    tooltip={"placement": "bottom", "always_visible": False}
+                ), label_id="projection-param-label"),
+                dcc.Checklist([" Use Testset"], [], id="use-testset"),
+            ], title_id="sidebar-tab-header", section_id="sidebar-projection"),
 
-            html.H4("Projection", id="sidebar-tab-header"),
-            # --------------- Projection Controls ---------------
-            html.Div([
-                html.Div([
-                    # -------- Final Object Metric --------
-                    html.Div([
-                        html.Div("Object Metric", style={"textAlign": "center"}),
-                        dcc.Dropdown(
-                            id="fo-metric",
-                            options=final_object_metrics,
-                            value="total_reward",
-                            clearable=False,
-                            style={"color": "black"}
-                        )
-                    ], style={
-                        "display": "flex",
-                        "flexDirection": "column",
-                        "gap": "6px"
-                    }),
+            # -------- DAG controls --------
+            section("DAG", [
+                control("Layout", dcc.Dropdown(
+                    id="dag-layout",
+                    options=[
+                        {"label": "Klay", "value": "klay"},
+                        {"label": "Dagre", "value": "dagre"},
+                        {"label": "Breadthfirst", "value": "breadthfirst"}
+                    ],
+                    value="klay",
+                    clearable=False,
+                )),
+                control("Metric", dcc.Dropdown(
+                    id="dag-metric",
+                    options=["highest", "lowest", "variance", "frequency"],
+                    value="highest",
+                    clearable=False,
+                )),
+                control("Direction", dcc.RadioItems(
+                    id="dag-direction",
+                    options=["forward", "backward"],
+                    value="forward",
+                    inline=True,
+                )),
+            ], section_id="sidebar-dag", class_name="gfs-section gfs-hidden"),
+        ], className="gfs-sidebar"),
 
-                    # -------- Ranking Metric --------
-                    html.Div([
-                        html.Div("Ranking Metric", style={"textAlign": "center"}),
-                        dcc.Dropdown(
-                            id="ranking-metric",
-                            options=["highest over all", "highest per iter", "lowest over all", "lowest per iter"],
-                            value="highest over all",
-                            clearable=False,
-                            style={"color": "black"}
-                        )
-                    ], style={
-                        "display": "flex",
-                        "flexDirection": "column",
-                        "gap": "6px"
-                    }),
-
-                    # -------- Use Testset --------
-                    dcc.Checklist([" Use Testset"], [], id="use-testset", style={
-                        "display": "flex",
-                        "flexDirection": "column",
-                        "gap": "6px"
-                    }),
-                    # -------- State Space Style --------
-                    html.Div([
-                        html.Div("State Space Style", style={"textAlign": "center"}),
-                        dcc.Dropdown(
-                            id="state-space-style",
-                            options=["Hex Ratio", "Hex Obj. Metric", "Hex Correlation", "Scatter"],
-                            value="Hex Ratio",
-                            clearable=False,
-                            style={"color": "black"}
-                        )
-                    ], style={
-                        "display": "flex",
-                        "flexDirection": "column",
-                        "gap": "6px"
-                    }),
-                    # -------- Projection method --------
-                    html.Div([
-                        html.Div("Dimensionality reduction", style={"textAlign": "center"}),
-                        dcc.Dropdown(
-                            id="projection-method",
-                            options=[
-                                {"label": "UMAP", "value": "umap"},
-                                {"label": "t-SNE", "value": "tsne"}
-                            ],
-                            value="tsne",
-                            clearable=False,
-                            style={"color": "black"}
-                        )
-                    ], style={
-                        "display": "flex",
-                        "flexDirection": "column",
-                        "gap": "6px",
-                    }),
-                    # -------- Projection param --------
-                    html.Div([
-                        html.Div(
-                            id="projection-param-label",
-                            style={"textAlign": "center"}
-                        ),
-                        dcc.Slider(
-                            id="projection-param",
-                            min=5,
-                            max=50,
-                            step=1,
-                            value=15,
-                            marks=None,
-                            tooltip={"placement": "bottom", "always_visible": False}
-                        )
-                    ], style={
-                        "display": "flex",
-                        "flexDirection": "column",
-                        "gap": "6px"
-                    }),
-
-                ], style={
-                    "display": "flex",
-                    "flexDirection": "column",
-                    "gap": "50px"
-                })
-
-            ], id = "sidebar-projection", style={
-                "display": "flex",
-                "flexDirection": "column",
-                "gap": "50px"
-            }),
-
-
-            # --------------- DAG Controls ---------------
-            html.Div([
-                html.Div([
-                    # -------- Layout --------
-                    html.Div([
-                        html.Div("Layout", style={"textAlign": "center"}),
-                        dcc.Dropdown(
-                            id="dag-layout",
-                            options=[
-                                {"label": "Klay", "value": "klay"},
-                                {"label": "Dagre", "value": "dagre"},
-                                {"label": "Breadthfirst", "value": "breadthfirst"}
-                            ],
-                            value="klay",
-                            clearable=False,
-                            style={"color": "black"}
-                        )
-                    ], style={
-                        "display": "flex",
-                        "flexDirection": "column",
-                        "gap": "6px"
-                    }),
-
-                    # -------- Metric --------
-                    html.Div([
-                        html.Div("Metric", style={"textAlign": "center"}),
-                        dcc.Dropdown(
-                            id="dag-metric",
-                            options=["highest", "lowest", "variance", "frequency"],
-                            value="highest",
-                            clearable=False,
-                            style={"color": "black"}
-                        )
-                    ], style={
-                        "display": "flex",
-                        "flexDirection": "column",
-                        "gap": "6px"
-                    }),
-
-                    # -------- Direction --------
-                    html.Div([
-                        html.Div("Direction", style={"textAlign": "center"}),
-                        dcc.RadioItems(
-                            id="dag-direction",
-                            options=["forward", "backward"],
-                            value="forward",
-                        ),
-                    ], style={
-                        "display": "flex",
-                        "flexDirection": "column",
-                        "gap": "6px"
-                    }),
-
-
-                ], style={
-                    "display": "flex",
-                    "flexDirection": "column",
-                    "gap": "50px"
-                })
-
-            ], id = "sidebar-dag", style={
-                "display": "flex",
-                "flexDirection": "column",
-                "gap": "50px"
-            })
-
-        ], style={
-            "width": "12%",
-            "minWidth": "180px",
-            "maxWidth": "250px",
-            "padding": "12px",
-            "height": "100vh",
-            #"borderRight": "1px solid #ddd",
-            "overflow": "auto"
-        }),
-
-        # ================= RIGHT CONTENT AREA (88%) =================
+        # ================= RIGHT CONTENT AREA =================
         html.Div([
 
             # ================= STATE-SPACE TAB =================
             html.Div([
-                # TOP ROW
-                html.Div([
-                    # TOP LEFT
-                    html.Div([
-                        html.Div(
-                            dcc.Graph(id="bumpchart", clear_on_unhover=True),
-                            style={"height": "100%", "width": "100%"}
-                        ),
-                    ], style={
-                        "flex": 1,
-                        #"border": "1px solid #ddd",
-                        "padding": "5px",
-                        "height": "35vh",
-                        "boxSizing": "border-box",
-                        "overflow": "hidden"
-                    }),
-
-                    # TOP RIGHT
-
-                ], style={
-                    "display": "flex",
-                    "flexDirection": "row",
-                    "width": "100%"
-                }),
-
-                # BOTTOM ROW
-                html.Div([
-                    # BOTTOM LEFT
-                    html.Div([
-                        html.Div(
-                            dcc.Graph(
-                                id="state-space-plot",
-                                clear_on_unhover=True,
-                                style={"height": "100%", "width": "100%"}
-                            ),
-                            style={"height": "100%", "width": "100%"}
-                        ),
-
-                    ], style={
-                        "flex": 1,
-                        #"border": "1px solid #ddd",
-                        "padding": "5px",
-                        "height": "65vh",
-                        "boxSizing": "border-box",
-                    }),
-
-                    # BOTTOM RIGHT
-
-                ], style={
-                    "display": "flex",
-                    "flexDirection": "row",
-                    "width": "100%"
-                })
-            ], id="state-space-tab", style={"display": "block"}),
+                html.Div(
+                    dcc.Graph(
+                        id="bumpchart",
+                        clear_on_unhover=True,
+                        style={"height": "100%", "width": "100%"},
+                        config={"responsive": True},
+                    ),
+                    className="gfs-bump",
+                ),
+                html.Div(
+                    dcc.Graph(
+                        id="state-space-plot",
+                        clear_on_unhover=True,
+                        style={"height": "100%", "width": "100%"},
+                        config={"responsive": True},
+                    ),
+                    className="gfs-statespace",
+                ),
+            ], id="state-space-tab", className="gfs-tab gfs-tab-ss"),
 
             # ================= DAG TAB =================
             html.Div([
+                # DAG Overview
                 html.Div([
-                    # DAG Overview
                     html.Div([
-                        html.Div(
-                            [
-                                html.Button(
-                                    "Top 150",
-                                    id="dag-overview-button-top",
-                                    style={"flex": 1, "height": "40px", "border-top-left-radius": "8px",}
-                                ),
-                                html.Button(
-                                    "Previous 150",
-                                    id="dag-overview-button-prev",
-                                    style={"flex": 1, "height": "40px", "border-top-right-radius": "8px",}),
-                            ],
-                            style={
-                                "display": "flex",
-                                "margin-top": "10px",
-                            },
+                        html.Button("Top 150", id="dag-overview-button-top", className="gfs-btn"),
+                        html.Button("Previous 150", id="dag-overview-button-prev", className="gfs-btn"),
+                    ], className="gfs-btn-row"),
+                    html.Div(
+                        dcc.Graph(
+                            id="dag-overview",
+                            clear_on_unhover=True,
+                            style={"height": "100%", "width": "100%"},
+                            config={"responsive": True},
                         ),
-
-                        # --- Graph (fills remaining height) ---
-                        html.Div(
-                            dcc.Graph(
-                                id="dag-overview",
-                                clear_on_unhover=True,
-                                style={"height": "100%", "width": "100%"},
-                                config={"responsive": True},
-                            ),
-                            style={"flex": 1},
-                        ),
-
-                        # --- Bottom button ---
-                        html.Button(
-                            "Next 150",
-                            id="dag-overview-button-next",
-                            style={
-                                "height": "40px",
-                                "width": "100%",
-                                "border-bottom-left-radius": "8px",
-                                "border-bottom-right-radius": "8px",
-                                "margin-bottom": "10px",
-                            },
-                        ),
-                    ],style={
-                            "display": "flex",
-                            "flexDirection": "column",
-                            "flex": "0 0 400px",
-                            "height": "100vh",
-                            "width": "400px",
-                            "gap": "8px",
-                        },
+                        className="gfs-fill",
                     ),
-                    # DAG AREA
-                    html.Div([
+                    html.Button("Next 150", id="dag-overview-button-next", className="gfs-btn"),
+                ], className="gfs-dag-overview"),
 
-                        html.Div("DAG-title", id="dag-title", style={
-                            "height": "20px",
-                            #"border": "1px solid #ddd",
-                            "boxSizing": "border-box",
-                            "padding-top": "3px",
-                            "font-size": "12px",
-                            "font-weight": "bold",
-                            "margin-top": "2px",
-                        }),
-                        html.Div("DAG-subtitle", id="dag-subtitle", style={
-                            "height": "24px",
-                            #"border": "1px solid #ddd",
-                            "boxSizing": "border-box",
-                            "padding-top": "3px",
-                            "font-size": "10px",
-                            "margin-bottom": "13px",
-                            "margin-top": "2px",
-                            "whiteSpace": "pre-line",
-                        }),
+                # DAG area
+                html.Div([
+                    html.Div("DAG-title", id="dag-title", className="gfs-dag-title"),
+                    html.Div("DAG-subtitle", id="dag-subtitle", className="gfs-dag-subtitle"),
+                    html.Div(
+                        cyto.Cytoscape(
+                            id='dag-graph',
+                            layout={
+                                'name': 'klay',
+                                'directed': True,
+                                'spacingFactor': 0.5,
+                                'animate': False
+                            },
+                            style={'width': '100%', 'height': '100%', 'background-color': '#FFFFFF'},
+                            elements=[],
+                            stylesheet=[]
+                        ),
+                        className="gfs-fill gfs-dag-canvas",
+                    ),
+                ], className="gfs-dag-main"),
 
-                        html.Div([
-                            cyto.Cytoscape(
-                                id='dag-graph',
-                                layout={
-                                    'name': 'klay',
-                                    'directed': True,
-                                    'spacingFactor': 0.5,
-                                    'animate': False
-                                },
-                                style={'flex': '1', 'height': '100%', 'width': '0px', 'background-color': '#FFFFFF'},
-                                elements=[],
-                                stylesheet=[]
-                            ),
-                        ], style={
-                            "display": "flex",
-                            "flexDirection": "row",
-                            "flex": 1,
-                            #"border": "1px solid #ddd",
-                            "boxSizing": "border-box"
-                        })
-                    ], style={
-                        "flex": 1,
-                        "display": "flex",
-                        "flexDirection": "column",
-                        "height": "100vh",
-                        "margin-right": "10px",
-                        "margin-left": "10px",
-                    }),
-
-                    # RIGHT SIDE - DATA TABLE
+                # Data table
+                html.Div(
                     dash_table.DataTable(
                         id='dag-table',
                         columns=[
                             {
-                                "name": "Image",
+                                "name": "State",
                                 "id": "image",
                                 "presentation": "markdown",
                             },
@@ -596,28 +451,39 @@ def run_dashboard(
                         selected_row_ids=[],
                         page_size=10,
                         markdown_options={"html": True},
+                        style_table={"overflow": "auto", "flex": "1 1 auto", "minHeight": 0},
                         style_cell={
-                            'fontFamily': 'Arial',
-                            'backgroundColor': '#FFFFFF',
+                            "fontFamily": "\"Open Sans\", verdana, arial, sans-serif",
+                            "fontSize": "12px",
+                            "padding": "4px 6px",
+                            "whiteSpace": "normal",
+                            "height": "auto",
+                            "backgroundColor": "#FFFFFF",
+                            "border": "1px solid var(--gfs-border)",
                         },
+                        style_cell_conditional=[
+                            {"if": {"column_id": "image"}, "textAlign": "left",
+                             "minWidth": "90px", "width": "50%", "maxWidth": "220px"},
+                            {"if": {"column_id": "node_type"}, "width": "48px"},
+                        ],
                         style_header={
-                            'backgroundColor': '#FFFFFF',
-                            'fontWeight': 'bold'
+                            "backgroundColor": "var(--gfs-bg)",
+                            "fontWeight": "600",
                         },
-                        style_table={'width': '500px', 'height': '95vh', 'flex': '0 0 400px', 'overflow': 'auto'}
-                    )
-                ], style={
-                    "display": "flex",
-                    "flexDirection": "row",
-                    "height": "98vh"
-                })
-            ], id="dag-tab", style={"display": "none"})
+                        style_data_conditional=[
+                            {"if": {"state": "active"},
+                             "backgroundColor": "var(--gfs-accent-weak)",
+                             "border": "1px solid var(--gfs-accent)"},
+                            {"if": {"state": "selected"},
+                             "backgroundColor": "var(--gfs-accent-weak)",
+                             "border": "1px solid var(--gfs-border)"},
+                        ],
+                    ),
+                    className="gfs-dag-table",
+                ),
+            ], id="dag-tab", className="gfs-tab gfs-tab-dag gfs-hidden"),
 
-        ], style={
-            "width": "88%",
-            "height": "100vh",
-            "overflow": "hidden"
-        }),
+        ], className="gfs-main"),
         dcc.Tooltip(
             id="image-tooltip4",
             direction="right",
@@ -626,35 +492,24 @@ def run_dashboard(
         dcc.Tooltip(id="image-tooltip3", direction="bottom"),
         dcc.Tooltip(id="image-tooltip1", direction="top"),
 
-    ], style={
-        "display": "flex",
-        "flexDirection": "row",
-        "width": "100vw",
-        "height": "100vh"
-    })
+    ], className="gfs-app")
 
 
     # ================= CALLBACK TO SWITCH TABS =================
     @app.callback(
-        [Output("state-space-tab", "style"),
-         Output("dag-tab", "style"),
+        [Output("state-space-tab", "className"),
+         Output("dag-tab", "className"),
          Output("active-tab", "data"),
-         Output("tab-state-space", "style"),
-         Output("tab-dag-view", "style"),
-         Output("sidebar-projection", "style"),
-         Output("sidebar-dag", "style"),
-         Output("sidebar-tab-header", "children")],
+         Output("tab-state-space", "className"),
+         Output("tab-dag-view", "className"),
+         Output("sidebar-projection", "className"),
+         Output("sidebar-dag", "className")],
         [Input("tab-state-space", "n_clicks"),
          Input("tab-dag-view", "n_clicks")],
         [State("active-tab", "data")]
     )
     def switch_tabs(state_clicks, dag_clicks, current_tab):
-        ctx = dash.callback_context
-        if not ctx.triggered:
-            button_id = "tab-state-space"
-        else:
-            button_id = ctx.triggered[0]["prop_id"].split(".")[0]
-
+        button_id = ctx.triggered_id or "tab-state-space"
         if button_id == "tab-state-space":
             active_tab = "state-space"
         elif button_id == "tab-dag-view":
@@ -662,46 +517,18 @@ def run_dashboard(
         else:
             active_tab = current_tab
 
-        # Base button styles
-        active_style = {
-            "border": "2px solid #3b82f6",
-            "backgroundColor": "#3b82f6",
-            "color": "white",
-            "transition": "all 0.3s ease",
-        }
-        inactive_style = {
-            "border": "2px solid #e5e7eb",
-            "backgroundColor": "white",
-            "color": "#6b7280",
-            "transition": "all 0.3s ease",
-        }
-        top_style = {"border-top-left-radius": "8px", "border-top-right-radius": "8px"}
-        bottom_style = {"border-bottom-left-radius": "8px", "border-bottom-right-radius": "8px"}
+        show, hide = "", " gfs-hidden"
+        ss, dag = (show, hide) if active_tab == "state-space" else (hide, show)
+        return (
+            "gfs-tab gfs-tab-ss" + ss,
+            "gfs-tab gfs-tab-dag" + dag,
+            active_tab,
+            "gfs-btn active" if active_tab == "state-space" else "gfs-btn",
+            "gfs-btn active" if active_tab == "dag-view" else "gfs-btn",
+            "gfs-section" + ss,
+            "gfs-section" + dag,
+        )
 
-        # Apply styles based on active tab
-        if active_tab == "state-space":
-
-            return (
-                {"display": "block"},
-                {"display": "none"},
-                "state-space",
-                active_style | top_style,
-                inactive_style | bottom_style,
-                {"display": "block"},
-                {"display": "none"},
-                "Final Objects"
-            )
-        else:
-            return (
-                {"display": "none"},
-                {"display": "block"},
-                "dag-view",
-                inactive_style | top_style,
-                active_style | bottom_style,
-                {"display": "none"},
-                {"display": "block"},
-                "DAG"
-            )
 
     # The DAG is laid out while its tab may be hidden (container width 0), so the
     # viewport is not fitted. Resize and fit it when the DAG tab is shown.
@@ -888,7 +715,7 @@ def run_dashboard(
                         return "<br>".join(state)
                     return (
                         f'<img src="{state}" '
-                        f'style="height:80px;" />'
+                        f'style="height:80px; max-width:100%; object-fit:contain;" />'
                     )
 
                 children["image"] = children["id"].apply(image_cell)
