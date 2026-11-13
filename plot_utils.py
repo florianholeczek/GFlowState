@@ -1102,6 +1102,17 @@ class Plotter:
             idx = int(norm * (len(colorscale) - 1))
             return colorscale[idx]
 
+        # Color of each edge goes into its data and is mapped by one stylesheet rule
+        # (one rule per edge made Cytoscape match every rule against every edge)
+        # Rows with the same id (variance: several edges in the latest iteration) get the
+        # color of the last one, as with the former per-id rules
+        color_by_id = {
+            edge['data'].get('id'): get_color(edge['data'].get("metric", 0), vmin, vmax, colorscale)
+            for edge in edges
+        }
+        for edge in edges:
+            edge['data']['color'] = color_by_id[edge['data'].get('id')]
+
         # Build stylesheet
         elements = nodes + edges
 
@@ -1193,7 +1204,9 @@ class Plotter:
                     'width': 2,
                     'target-arrow-shape': 'triangle',
                     'curve-style': 'bezier',
-                    'arrow-scale': 1
+                    'arrow-scale': 1,
+                    'line-color': 'data(color)',
+                    'target-arrow-color': 'data(color)',
                 }
             }
         ]
@@ -1215,20 +1228,6 @@ class Plotter:
                     }
                 },
             )
-
-        # Add color styles for each edge
-        for edge in edges:
-            edge_id = edge['data']['id']
-            edge_val = edge['data'].get("metric", 0)
-            color = get_color(edge_val, vmin, vmax, colorscale)
-
-            stylesheet.append({
-                'selector': f'edge[id = "{edge_id}"]',
-                'style': {
-                    'line-color': color,
-                    'target-arrow-color': color
-                }
-            })
 
         return {
             'elements': elements,
@@ -1289,7 +1288,7 @@ class Plotter:
                         ORDER BY max_val DESC
                         LIMIT {top_n} OFFSET {offset}
                     )
-                    SELECT e.source, e.target, e.iteration, e.{column} as value, em.max_val as metric_val, e.trajectory_id
+                    SELECT e.source, e.target, e.iteration, e.{column} as value, em.max_val as metric_val
                     FROM edges e
                     INNER JOIN edge_max em ON e.source = em.source AND e.target = em.target
                     WHERE e.iteration BETWEEN ? AND ?
@@ -1305,7 +1304,7 @@ class Plotter:
                         ORDER BY min_val ASC
                         LIMIT {top_n} OFFSET {offset}
                     )
-                    SELECT e.source, e.target, e.iteration, e.{column} as value, em.min_val as metric_val, e.trajectory_id
+                    SELECT e.source, e.target, e.iteration, e.{column} as value, em.min_val as metric_val
                     FROM edges e
                     INNER JOIN edge_min em ON e.source = em.source AND e.target = em.target
                     WHERE e.iteration BETWEEN ? AND ?
@@ -1337,7 +1336,7 @@ class Plotter:
                         ORDER BY variance DESC
                         LIMIT {top_n} OFFSET {offset}
                     )
-                    SELECT e.source, e.target, e.iteration, e.{column} as value, ev.mean_val, ev.variance as metric_val, e.trajectory_id
+                    SELECT e.source, e.target, e.iteration, e.{column} as value, ev.mean_val, ev.variance as metric_val
                     FROM edges e
                     INNER JOIN edge_variance ev ON e.source = ev.source AND e.target = ev.target
                     WHERE e.iteration BETWEEN ? AND ?
@@ -1353,7 +1352,7 @@ class Plotter:
                         ORDER BY freq DESC
                         LIMIT {top_n} OFFSET {offset}
                     )
-                    SELECT e.source, e.target, e.iteration, e.{column} as value, ef.freq as metric_val, e.trajectory_id
+                    SELECT e.source, e.target, e.iteration, e.{column} as value, ef.freq as metric_val
                     FROM edges e
                     INNER JOIN edge_freq ef ON e.source = ef.source AND e.target = ef.target
                     WHERE e.iteration BETWEEN ? AND ?
@@ -1365,7 +1364,8 @@ class Plotter:
         conn.close()
 
         if df.empty:
-            return go.Figure().add_annotation(text="No data found", showarrow=False)
+            fig = go.Figure().add_annotation(text="No data found", showarrow=False)
+            return fig, None, []
 
         # Create edge identifier and preserve order
         df['edge_id'] = df['source'].astype(str) + '-' + df['target'].astype(str)
@@ -1385,9 +1385,8 @@ class Plotter:
         else:
             df['plot_value'] = df['value']
 
-        # create edge list and trajectory id list for hover and selection
-        trajectory_id_list = df.groupby('edge_idx')['trajectory_id'].agg(list).tolist()
-        edge_list = df[['source', "target", "edge_idx"]]
+        # create edge list (source, target per row) for hover and selection
+        edge_list =df[['source', "target", "edge_idx"]]
         edge_list = edge_list.drop_duplicates().reset_index(drop=True)
         edge_list = list(edge_list[['source', 'target']].itertuples(index=False, name=None))
 
@@ -1472,8 +1471,8 @@ class Plotter:
         fig.update_yaxes(autorange="reversed")
 
         if metric == "frequency":
-            return fig, zmax, trajectory_id_list, edge_list
-        return fig, None, trajectory_id_list, edge_list
+            return fig, zmax, edge_list
+        return fig, None, edge_list
 
     def edge_hover_fig(self, edge_data):
         fig = go.Figure()

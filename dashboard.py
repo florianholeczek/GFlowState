@@ -1,3 +1,4 @@
+import threading
 import warnings
 from functools import lru_cache
 import dash
@@ -39,7 +40,12 @@ def run_dashboard(
         raise FileNotFoundError(f"Folder does not exist: {data_folder}")
     if not data_path.exists() or (not data_path.is_file()):
         raise FileNotFoundError(f"Data does not exist: {data_path}")
-    
+
+    # Callbacks run in parallel threads. Image and aggregation functions often draw with
+    # matplotlib's pyplot, whose current figure is shared by all threads: concurrent calls
+    # can save another thread's unfinished figure (wrong crop / zoom). Serialize them.
+    render_lock = threading.RLock()
+
     if text_to_img_fn is None:
         warnings.warn(
             "No text-to-image function provided. "
@@ -49,13 +55,17 @@ def run_dashboard(
         def image_fn(state):
             return None
     else:
+        # Cached: images are requested repeatedly for the same states (DAG updates, hovers).
+        # Returned lists are shared between calls and must not be mutated.
+        @lru_cache(maxsize=4096)
         def image_fn(state):
             if state == "#":
                 return None
-            result = text_to_img_fn(state)
+            with render_lock:
+                result = text_to_img_fn(state)
             if isinstance(result, list):
                 return result
-            return f"data:image/svg+xml;base64,{text_to_img_fn(state)}"
+            return f"data:image/svg+xml;base64,{result}"
 
     if state_aggregation_fn is None:
         warnings.warn(
@@ -64,16 +74,23 @@ def run_dashboard(
         def agg_fn(states):
             return None
     else:
+        # Cached by the (ordered) states, e.g. a molecule MCS is expensive.
+        # Returned lists are shared between calls and must not be mutated.
+        @lru_cache(maxsize=256)
+        def _agg_cached(states):
+            with render_lock:
+                agg = state_aggregation_fn(list(states))
+            if isinstance(agg, str):
+                return f"data:image/svg+xml;base64,{agg}"
+            return agg
+
         def agg_fn(states):
             if len(states) == 0:
                 return None
             elif len(states) == 1:
                 return image_fn(states[0])
             else:
-                agg = state_aggregation_fn(states)
-                if isinstance(agg, str):
-                    return f"data:image/svg+xml;base64,{agg}"
-                return agg
+                return _agg_cached(tuple(states))
 
 
     plotter = Plotter(data_path, image_fn, agg_fn, s0)
@@ -106,7 +123,6 @@ def run_dashboard(
         dcc.Store(id="selected-objects", data=[]),
         dcc.Store(id="build-ids", data= ["#"]),
         dcc.Store(id="max-frequency", data= 0),
-        dcc.Store(id="dag-overview-tid-list", data= []),
         dcc.Store(id="dag-overview-edge-list", data= []),
         dcc.Store(id="dag-overview-page", data=0),
         dcc.Store(id="dag-fit-dummy"),
@@ -740,14 +756,14 @@ def run_dashboard(
         Input("dag-overview", "selectedData"),
         State("selected-objects", "data"),
         State("build-ids", "data"),
-        State("dag-overview-tid-list", "data"),
+        State("dag-overview-edge-list", "data"),
         State("iteration", "value"),
         State("projection-method", "value"),
         State("projection-param", "value"),
         State("use-testset", "value"),
         prevent_initial_call=True
     )
-    def update_selected_objects(clear_clicks, ss_select, ss_click, bump_select, dag_node, selected_tids, current_ids, build_ids, tid_list, iterations, method, param_value, use_testset):
+    def update_selected_objects(clear_clicks, ss_select, ss_click, bump_select, dag_node, selected_tids, current_ids, build_ids, edge_list, iterations, method, param_value, use_testset):
 
         ctx = dash.callback_context
         if not ctx.triggered:
@@ -904,24 +920,28 @@ def run_dashboard(
             if not selected_tids or "range" not in selected_tids:
                 return no_update
 
+            # selected rows of the heatmap are edges (source, target),
+            # the selected x range is an iteration range within the slider range
             y_range = np.round(selected_tids["range"]["y"]).astype(int)
-            t_ids = tid_list[y_range[0]:y_range[1] + 1]
-            t_ids = list({elem for sublist in t_ids for elem in sublist})
-            iterations = np.round(selected_tids["range"]["x"]).astype(int).tolist()
+            selected_edges = (edge_list or [])[max(y_range[0], 0):y_range[1] + 1]
+            if not selected_edges:
+                return [], None, []
+            x_range = np.round(selected_tids["range"]["x"]).astype(int).tolist()
+            it0 = max(x_range[0], int(iterations[0]))
+            it1 = min(x_range[1], int(iterations[1]))
 
-
-            # get trajectory ids that are also in iteration range and then all node ids for these trajectory_ids
+            # trajectories that use one of the selected edges in the iteration range
             conn = connect_ro(data_path)
-            placeholders = ",".join("?" for _ in t_ids)
+            pairs = ",".join("(?, ?)" for _ in selected_edges)
             query = f"""
             SELECT DISTINCT trajectory_id
             FROM edges
-            WHERE trajectory_id IN ({placeholders})
+            WHERE (source, target) IN (VALUES {pairs})
                 AND iteration BETWEEN ? AND ?
             """
-            params = t_ids + [iterations[0], iterations[1]]
+            params = [v for edge in selected_edges for v in edge] + [it0, it1]
             selected_ids = pd.read_sql_query(query, conn, params=params)
-            selected_ids = list(set(selected_ids["trajectory_id"].to_list()))
+            selected_ids = selected_ids["trajectory_id"].to_list()
             conn.close()
             return selected_ids, None, []
 
@@ -992,6 +1012,25 @@ def run_dashboard(
         order = "highest" if "highest" in rank_metric else "lowest"
         return plotter.prepare_bump_all(df, n_top, order)
 
+    @lru_cache(maxsize=256)
+    def hex_hover_data(iteration, usetestset, method, param_value, hex_q, hex_r, metric, ss_style):
+        """
+        Figures and state aggregation for the hover of one hex. Cached: the projection for
+        these inputs is fixed, so the db queries and the (possibly expensive) aggregation
+        only run on the first hover. The returned objects must not be mutated.
+        """
+        dp, _ = plotter.get_projection(list(iteration), usetestset, method, param_value)
+        figures, texts = plotter.hex_hover_figures(
+            dp,
+            hex_q,
+            hex_r,
+            metric,
+            ss_style,
+            metric in testset_metrics,
+            usetestset
+        )
+        return figures, plotter.agg_fn(texts)
+
 
     # State Space Callback
     @app.callback(
@@ -1003,10 +1042,14 @@ def run_dashboard(
         Input("use-testset", "value"),
         Input("fo-metric", "value"),
         Input("state-space-style", "value"),
+        Input("active-tab", "data"),
     )
-    def update_projection_plots(selected_ids, method, param_value, iteration, use_testset, metric, ss_style):
+    def update_projection_plots(selected_ids, method, param_value, iteration, use_testset, metric, ss_style, active_tab):
         ctx = dash.callback_context
         if not ctx.triggered:
+            return no_update
+        # Not visible on the DAG tab: skip, switching back to this tab triggers the update
+        if active_tab != "state-space":
             return no_update
         check_choice(ss_style, (*HEX_STYLES, "Scatter"), "state space style")
 
@@ -1129,7 +1172,6 @@ def run_dashboard(
     @app.callback(
         Output("dag-overview", "figure"),
         Output("max-frequency", "data"),
-        Output("dag-overview-tid-list", "data"),
         Output("dag-overview-edge-list", "data"),
         Input("dag-direction", "value"),
         Input("dag-metric", "value"),
@@ -1137,10 +1179,10 @@ def run_dashboard(
         Input("dag-overview-page", "data")
     )
     def update_dag_overview(direction, metric, iteration, page):
-        fig, max_freq, ids, edge_list = plotter.update_DAG_overview(direction, metric, iteration, page)
+        fig, max_freq, edge_list = plotter.update_DAG_overview(direction, metric, iteration, page)
         if max_freq:
-            return fig, max_freq, ids, edge_list
-        return fig, no_update, ids, edge_list
+            return fig, max_freq, edge_list
+        return fig, no_update, edge_list
 
     #hover state space
     @app.callback(
@@ -1179,15 +1221,15 @@ def run_dashboard(
                     metric_title = f"Correlation log reward and logprobs: {metric_value:.2f}"
 
 
-            dp, _ = plotter.get_projection(iteration, usetestset, method, param_value)
-            figures, texts = plotter.hex_hover_figures(
-                dp,
-                hex_q,
-                hex_r,
+            figures, aggregation = hex_hover_data(
+                (int(iteration[0]), int(iteration[1])),
+                bool(usetestset),
+                method,
+                int(param_value),
+                int(hex_q),
+                int(hex_r),
                 metric,
                 ss_style,
-                metric in testset_metrics,
-                usetestset
             )
             fig_graphs = [
                 dcc.Graph(
@@ -1198,7 +1240,6 @@ def run_dashboard(
                 for fig in figures
                 if fig is not None
             ]
-            aggregation = plotter.agg_fn(texts)
             if isinstance(aggregation, list):
                 aggregation = [html.Div(i, style={"color": "black", "marginTop": "5px"}) for i in aggregation]
             elif isinstance(aggregation, str):
